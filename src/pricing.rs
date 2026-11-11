@@ -1,5 +1,6 @@
 //! Model pricing: models.dev primary, LiteLLM fallback — matching ccusage.
 //! Fetched at runtime, cached under XDG cache, `--offline` reads cache only.
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 const MODELSDEV_URL: &str = "https://models.dev/api.json";
@@ -17,24 +18,24 @@ pub struct Price {
 
 impl Price {
     pub fn is_free(&self) -> bool {
-        self.input == 0.0 && self.output == 0.0
-            && self.cache_creation == 0.0 && self.cache_read == 0.0
+        self.input == 0.0
+            && self.output == 0.0
+            && self.cache_creation == 0.0
+            && self.cache_read == 0.0
     }
 }
 
 #[derive(Default)]
 pub struct Pricing {
-    /// normalized model id -> price per token
-    map: std::collections::HashMap<String, Price>,
+    /// normalized model id -> price per token (BTreeMap so the fuzzy-match
+    /// fallback below resolves deterministically)
+    map: BTreeMap<String, Price>,
     /// memoized per-model resolution (exact + fuzzy) — misses are common
     cache: std::cell::RefCell<std::collections::HashMap<String, Option<Price>>>,
 }
 
 fn cache_dir() -> PathBuf {
-    std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| crate::agents::home().join(".cache"))
-        .join("rsusage")
+    crate::paths::xdg_cache()
 }
 
 fn fetch_cached(url: &str, file: &str, offline: bool) -> Option<String> {
@@ -45,7 +46,12 @@ fn fetch_cached(url: &str, file: &str, offline: bool) -> Option<String> {
         .and_then(|t| t.elapsed().ok())
         .is_some_and(|e| e.as_secs() < CACHE_MAX_AGE_SECS);
     if !offline && !fresh {
-        if let Ok(text) = ureq::get(url)
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(15)))
+            .build()
+            .new_agent();
+        if let Ok(text) = agent
+            .get(url)
             .call()
             .and_then(|mut r| r.body_mut().read_to_string())
         {
@@ -71,24 +77,26 @@ fn norm(model: &str) -> String {
     }
 }
 
-/// Insert into map only if absent (first writer wins).
-fn put(
-    map: &mut std::collections::HashMap<String, Price>,
-    key: String,
-    p: Price,
-) {
-    map.entry(key).or_insert(p);
-}
-
 impl Pricing {
     pub fn load(offline: bool) -> Self {
-        let mut map = std::collections::HashMap::new();
-        // models.dev on top (per-1M-token costs -> per-token).
-        // Canonical providers first so their prices win over resellers
-        // (bedrock/openrouter/... markup).
+        let mut map = BTreeMap::new();
+        // models.dev first (per-1M-token costs -> per-token); canonical
+        // providers before resellers so their prices win the first-writer-wins
+        // insert (bedrock/openrouter add markup).
         const PRIORITY: &[&str] = &[
-            "anthropic", "openai", "xai", "google", "z-ai", "zai-org", "zai",
-            "opencode", "kilo", "gemini", "deepseek", "moonshot", "qwen",
+            "anthropic",
+            "openai",
+            "xai",
+            "google",
+            "z-ai",
+            "zai-org",
+            "zai",
+            "opencode",
+            "kilo",
+            "gemini",
+            "deepseek",
+            "moonshot",
+            "qwen",
         ];
         if let Some(text) = fetch_cached(MODELSDEV_URL, "modelsdev_prices.json", offline) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -101,84 +109,125 @@ impl Pricing {
                             .unwrap_or(PRIORITY.len())
                     });
                     for prov in order {
-                        let pv = &providers[prov];
-                        let Some(models) = pv.get("models").and_then(|m| m.as_object()) else {
+                        let Some(models) =
+                            providers[prov].get("models").and_then(|m| m.as_object())
+                        else {
                             continue;
                         };
-                        let _ = prov;
                         for (name, mv) in models {
                             let Some(c) = mv.get("cost") else { continue };
-                            let g = |k: &str| {
-                                c.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) / 1e6
-                            };
+                            let g =
+                                |k: &str| c.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) / 1e6;
                             let p = Price {
                                 input: g("input"),
                                 output: g("output"),
                                 cache_creation: g("cache_write"),
                                 cache_read: g("cache_read"),
                             };
-                            // insert both raw and normalized keys
-                            put(&mut map, name.to_lowercase(), p.clone());
-                            put(&mut map, norm(name), p);
+                            map.entry(name.to_lowercase()).or_insert_with(|| p.clone());
+                            map.entry(norm(name)).or_insert(p);
                         }
                     }
                 }
             }
         }
-        // LiteLLM first (fallback: only fills keys models.dev doesn't cover)
+        // LiteLLM fills whatever models.dev doesn't cover
         if let Some(text) = fetch_cached(LITELLM_URL, "litellm_prices.json", offline) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                 if let Some(obj) = v.as_object() {
                     for (name, p) in obj {
                         let g = |k: &str| p.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
-                        put(
-                            &mut map,
-                            norm(name),
-                            Price {
-                                input: g("input_cost_per_token"),
-                                output: g("output_cost_per_token"),
-                                cache_creation: g("cache_creation_input_token_cost"),
-                                cache_read: g("cache_read_input_token_cost"),
-                            },
-                        );
+                        map.entry(norm(name)).or_insert(Price {
+                            input: g("input_cost_per_token"),
+                            output: g("output_cost_per_token"),
+                            cache_creation: g("cache_creation_input_token_cost"),
+                            cache_read: g("cache_read_input_token_cost"),
+                        });
                     }
                 }
             }
         }
-        Self { map, cache: std::cell::RefCell::new(std::collections::HashMap::new()) }
+        Self {
+            map,
+            cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
     }
 
     pub fn get(&self, model: &str) -> Option<Price> {
         let key = norm(model);
+        if key.is_empty() {
+            return None;
+        }
         if let Some(p) = self.cache.borrow().get(&key) {
             return p.clone();
         }
-        let resolved = if let Some(p) = self.map.get(&key) {
-            Some(p.clone())
-        } else {
-            // secondary: containment match (e.g. "claude-sonnet-4-5" inside a longer id)
-            let mut best: Option<&Price> = None;
-            for (k, p) in &self.map {
-                if (k.contains(&key) || key.contains(k.as_str())) && best.is_none() {
-                    best = Some(p);
-                }
-            }
-            best.cloned()
-        };
+        // containment match, e.g. "claude-sonnet-4-5" inside a longer id —
+        // first hit in sorted-key order wins so results are deterministic
+        let resolved = self.map.get(&key).cloned().or_else(|| {
+            self.map
+                .iter()
+                .find(|(k, _)| k.contains(&key) || key.contains(k.as_str()))
+                .map(|(_, p)| p.clone())
+        });
         self.cache.borrow_mut().insert(key, resolved.clone());
         resolved
     }
 
-    pub fn cost(&self, model: &str, input: u64, output: u64, cc: u64, cr: u64) -> Option<f64> {
-        self.get(model).map(|p| {
-            input as f64 * p.input
-                + output as f64 * p.output
-                + cc as f64 * p.cache_creation
-                + cr as f64 * p.cache_read
+    pub fn entry_cost(&self, e: &crate::types::UsageEntry) -> Option<f64> {
+        self.get(&e.model).map(|p| {
+            e.tokens.input as f64 * p.input
+                + e.tokens.output as f64 * p.output
+                + e.tokens.cache_creation as f64 * p.cache_creation
+                + e.tokens.cache_read as f64 * p.cache_read
         })
     }
+}
 
-    pub fn entry_cost(&self, e: &crate::types::UsageEntry) -> Option<f64> {
-        self.cost(&e.model, e.input, e.output, e.cache_creation, e.cache_read)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pricing_with(models: &[(&str, f64)]) -> Pricing {
+        Pricing {
+            map: models
+                .iter()
+                .map(|(n, i)| {
+                    (
+                        n.to_string(),
+                        Price {
+                            input: *i,
+                            output: 0.0,
+                            cache_creation: 0.0,
+                            cache_read: 0.0,
+                        },
+                    )
+                })
+                .collect(),
+            cache: Default::default(),
+        }
+    }
+
+    #[test]
+    fn lookup_exact_then_deterministic_fuzzy() {
+        let p = pricing_with(&[("claude-sonnet-4-5", 3.0), ("claude-sonnet", 1.0)]);
+        assert_eq!(p.get("claude-sonnet-4-5").unwrap().input, 3.0);
+        // normalized id contained in a longer key (or vice versa) resolves
+        assert!(p.get("anthropic/claude-sonnet-4-5-20250929").is_some());
+        // unknown ids are misses
+        assert!(p.get("totally-made-up-model").is_none());
+        // empty ids never match (they'd containment-hit arbitrary keys)
+        assert!(p.get("").is_none());
+        // misses are memoized but stay misses
+        assert!(p.get("totally-made-up-model").is_none());
+    }
+
+    #[test]
+    fn norm_strips_provider_and_date() {
+        assert_eq!(
+            norm("anthropic/Claude-Sonnet-4-5-20250929"),
+            "claude-sonnet-4-5"
+        );
+        assert_eq!(norm("gpt-5"), "gpt-5");
+        assert_eq!(norm("zai-org/GLM-4.6"), "glm-4.6");
     }
 }

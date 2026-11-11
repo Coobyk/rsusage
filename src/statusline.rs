@@ -1,17 +1,37 @@
 //! Compact one-line status output for agent hooks.
 use crate::agents::AgentReader;
+use crate::cli::DEFAULT_SESSION_HOURS;
 use crate::pricing::Pricing;
-use crate::report::{self, Ctx};
+use crate::report::{self, CostMode, Ctx};
 use crate::types::*;
 use std::io::{IsTerminal, Read};
 
-pub fn run(readers: &[Box<dyn AgentReader>], pricing: &Pricing, tz: &jiff::tz::TimeZone, json: bool) {
-    // optional hook payload on stdin (non-tty)
-    let mut stdin_buf = String::new();
-    if !std::io::stdin().is_terminal() {
-        let _ = std::io::stdin().read_to_string(&mut stdin_buf);
+/// A hook payload may arrive on stdin when invoked by the agent harness.
+/// Read it with a bound: when stdin is a held-open pipe (no data, no EOF),
+/// blocking on read_to_string would hang forever, so give up quickly.
+fn hook_payload() -> serde_json::Value {
+    if std::io::stdin().is_terminal() {
+        return serde_json::Value::Null;
     }
-    let payload = serde_json::from_str::<serde_json::Value>(&stdin_buf).unwrap_or_default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = std::io::stdin().read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let buf = rx
+        .recv_timeout(std::time::Duration::from_millis(50))
+        .unwrap_or_default();
+    serde_json::from_str(&buf).unwrap_or_default()
+}
+
+pub fn run(
+    readers: &[Box<dyn AgentReader>],
+    pricing: &Pricing,
+    tz: &jiff::tz::TimeZone,
+    json: bool,
+) {
+    let payload = hook_payload();
     let model = payload
         .pointer("/model/display_name")
         .or_else(|| payload.pointer("/model/id"))
@@ -19,20 +39,12 @@ pub fn run(readers: &[Box<dyn AgentReader>], pricing: &Pricing, tz: &jiff::tz::T
         .unwrap_or("")
         .to_string();
 
-    let mut entries: Vec<UsageEntry> = readers.iter().flat_map(|r| r.entries()).collect();
-    entries = crate::agents::dedup(entries);
+    let entries = crate::app::load_entries(readers);
 
     let now = jiff::Timestamp::now().as_millisecond();
-    let ctx = Ctx {
-        pricing,
-        mode: report::CostMode::Auto,
-        tz: tz.clone(),
-        merged: true,
-        by_agent: false,
-        no_cost: false,
-    };
+    // statusline never buckets by week — the sow value is irrelevant here
+    let ctx = Ctx::new(pricing, CostMode::Auto, tz.clone(), true, false, 1);
 
-    // today's cost
     let today_key = report::date_key(now, tz);
     let mut today = Acc::default();
     for e in &entries {
@@ -40,22 +52,16 @@ pub fn run(readers: &[Box<dyn AgentReader>], pricing: &Pricing, tz: &jiff::tz::T
             today.add(e, pricing);
         }
     }
-    let mut today_cost = 0.0;
-    for (m, agg) in &today.models {
-        today_cost += ctx.cost(m, agg).0;
-    }
+    let today_cost = ctx.acc_cost(&today);
 
-    // active block
-    let bl = report::blocks(&entries, 5, now, pricing, tz);
+    // statusline burn rate is cost over wall-clock block elapsed (differs
+    // from block_row's first→last-entry span — that's upstream's formula)
+    let bl = report::blocks(&entries, DEFAULT_SESSION_HOURS, now, pricing);
     let active = bl.iter().find(|b| b.is_active);
     let (burn_rate, remaining) = match active {
         Some(b) => {
             let elapsed_h = (now - b.start_ms).max(1) as f64 / 3_600_000.0;
-            let mut cost = 0.0;
-            for (m, agg) in &b.acc.models {
-                cost += ctx.cost(m, agg).0;
-            }
-            (cost / elapsed_h, (b.end_ms - now).max(0))
+            (ctx.acc_cost(&b.acc) / elapsed_h, (b.end_ms - now).max(0))
         }
         None => (0.0, 0),
     };

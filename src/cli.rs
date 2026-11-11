@@ -1,11 +1,17 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+/// Default billing-block length (hours); shared by `blocks -n` and statusline.
+pub const DEFAULT_SESSION_HOURS: i64 = 5;
 
 #[derive(Parser)]
-#[command(name = "rsusage", version, about = "Blazing fast usage reports for coding agents")]
+#[command(
+    name = "rsusage",
+    version,
+    about = "Blazing fast usage reports for coding agents"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
-    /// Default command flags (rsusage with no subcommand = daily)
     #[command(flatten)]
     pub default: ReportArgs,
 }
@@ -24,54 +30,20 @@ pub enum Cmd {
     Blocks(BlocksArgs),
     /// Display compact status line for Claude Code hooks (Beta)
     Statusline(StatusArgs),
-    /// Claude Code usage
-    Claude(Nested),
-    /// Codex usage
-    Codex(Nested),
-    /// OpenCode usage
-    Opencode(Nested),
-    /// Kilo usage
-    Kilo(Nested),
-    /// ZCode usage
-    Zcode(Nested),
-    /// Devin usage
-    Devin(Nested),
-    /// Zed usage
-    Zed(Nested),
-    /// Cursor usage
-    Cursor(Nested),
-    /// Grok usage
-    Grok(Nested),
-    /// Amp usage
-    Amp(Nested),
-    /// Gemini CLI usage
-    Gemini(Nested),
-    /// Qwen usage
-    Qwen(Nested),
-    /// Kimi usage
-    Kimi(Nested),
-    /// Goose usage
-    Goose(Nested),
-    /// GitHub Copilot usage
-    Copilot(Nested),
-    /// Droid usage
-    Droid(Nested),
-    /// Codebuff usage
-    Codebuff(Nested),
-    /// Hermes usage
-    Hermes(Nested),
-    /// pi-agent usage
-    Pi(Nested),
-    /// OpenClaw usage
-    Openclaw(Nested),
-    /// Antigravity usage
-    Antigravity(Nested),
+    /// Per-agent reports: `rsusage <agent> <daily|weekly|monthly|session|blocks|statusline>`
+    #[command(external_subcommand)]
+    Agent(Vec<String>),
 }
 
-#[derive(Args)]
-pub struct Nested {
+/// Reparse of an agent-scoped invocation (`rsusage opencode daily --json`
+/// arrives as `Agent(["opencode", "daily", "--json"])`).
+#[derive(Parser)]
+pub struct AgentCli {
     #[command(subcommand)]
-    pub cmd: AgentCmd,
+    pub cmd: Option<AgentCmd>,
+    /// bare `rsusage <agent> [flags]` defaults to a daily report
+    #[command(flatten)]
+    pub default: ReportArgs,
 }
 
 #[derive(Subcommand)]
@@ -84,8 +56,42 @@ pub enum AgentCmd {
     Statusline(StatusArgs),
 }
 
+#[derive(Clone, Copy, Default, PartialEq, ValueEnum)]
+pub enum Order {
+    #[default]
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum Weekday {
+    Sunday,
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+}
+
+impl Weekday {
+    /// Weekday index (Sunday=0 .. Saturday=6) used by week bucketing.
+    pub fn index(self) -> i64 {
+        match self {
+            Self::Sunday => 0,
+            Self::Monday => 1,
+            Self::Tuesday => 2,
+            Self::Wednesday => 3,
+            Self::Thursday => 4,
+            Self::Friday => 5,
+            Self::Saturday => 6,
+        }
+    }
+}
+
+/// Flags every report-like command shares.
 #[derive(Args, Clone, Default)]
-pub struct ReportArgs {
+pub struct FilterArgs {
     /// Output in JSON format
     #[arg(short = 'j', long)]
     pub json: bool,
@@ -99,14 +105,14 @@ pub struct ReportArgs {
     #[arg(short = 'z', long)]
     pub timezone: Option<String>,
     /// Cost calculation mode
-    #[arg(short = 'm', long, default_value = "auto", value_parser=["auto","calculate","display"])]
-    pub mode: String,
+    #[arg(short = 'm', long, default_value = "auto")]
+    pub mode: crate::report::CostMode,
     /// Show per-model cost breakdown
     #[arg(short = 'b', long)]
     pub breakdown: bool,
     /// Sort order
-    #[arg(short = 'o', long, default_value = "asc", value_parser=["asc","desc"])]
-    pub order: String,
+    #[arg(short = 'o', long, default_value = "asc")]
+    pub order: Order,
     /// Use cached pricing data instead of fetching
     #[arg(short = 'O', long, overrides_with = "no_offline")]
     pub offline: bool,
@@ -119,9 +125,6 @@ pub struct ReportArgs {
     /// Include per-agent JSON breakdowns in unified report rows
     #[arg(long)]
     pub by_agent: bool,
-    /// Emit multiple report sections from one load (daily,weekly,monthly,session)
-    #[arg(long)]
-    pub sections: Option<String>,
     /// Force compact table layout
     #[arg(long)]
     pub compact: bool,
@@ -137,18 +140,9 @@ pub struct ReportArgs {
     /// Path to configuration file
     #[arg(long)]
     pub config: Option<String>,
-    /// Show only the most recent N periods
-    #[arg(long)]
-    pub last: Option<u32>,
-    /// Start day of the week
-    #[arg(short = 'w', long, value_parser=["sunday","monday","tuesday","wednesday","thursday","friday","saturday"])]
-    pub start_of_week: Option<String>,
     /// Aggregate usage across all configured Claude instances
     #[arg(long)]
     pub instances: bool,
-    /// Live-updating report view
-    #[arg(long)]
-    pub live: bool,
     /// Show pricing mismatch information for debugging
     #[arg(short = 'd', long)]
     pub debug: bool,
@@ -163,10 +157,29 @@ pub struct ReportArgs {
     pub single_thread: bool,
 }
 
+/// Period-report flags (daily/weekly/monthly/session).
+#[derive(Args, Clone, Default)]
+pub struct ReportArgs {
+    #[command(flatten)]
+    pub filter: FilterArgs,
+    /// Emit multiple report sections from one load (daily,weekly,monthly,session)
+    #[arg(long)]
+    pub sections: Option<String>,
+    /// Show only the most recent N periods
+    #[arg(long)]
+    pub last: Option<u32>,
+    /// Start day of the week
+    #[arg(short = 'w', long)]
+    pub start_of_week: Option<Weekday>,
+}
+
 #[derive(Args, Clone, Default)]
 pub struct BlocksArgs {
     #[command(flatten)]
-    pub report: ReportArgs,
+    pub filter: FilterArgs,
+    /// Live-updating report view
+    #[arg(long)]
+    pub live: bool,
     /// Show only active block with projections
     #[arg(short = 'a', long)]
     pub active: bool,
@@ -177,7 +190,7 @@ pub struct BlocksArgs {
     #[arg(short = 't', long)]
     pub token_limit: Option<String>,
     /// Session block duration in hours
-    #[arg(short = 'n', long, default_value = "5")]
+    #[arg(short = 'n', long, default_value_t = DEFAULT_SESSION_HOURS)]
     pub session_length: i64,
 }
 

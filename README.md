@@ -60,6 +60,15 @@ OpenCode reads both the legacy `message` table and the v2
 `session_message`/`session_v2` schema, deduplicating by message id — matching
 upstream's coverage of newer OpenCode versions.
 
+## Layout
+
+`main.rs` is argument dispatch only. `app.rs` orchestrates (reader selection,
+entry loading, filtering, `--last` windows); `report.rs` aggregates and
+serializes rows; `render.rs` draws tables; `agents/` holds readers — a static
+registry in `agents/mod.rs` maps ids to constructors. SQLite readers share
+`cached_scan` for incremental watermark scanning through the entry cache.
+Run tests with `cargo test`.
+
 ## Performance notes
 
 - Parallel readers (rayon): JSONL files parsed across threads; big SQLite
@@ -93,7 +102,15 @@ upstream ccusage does not read Devin at all.
 - Claude schema verified row-for-row against ccusage 20.0.49 (daily/weekly/
   monthly/session/blocks); remaining diffs are ±1-ulp float formatting.
 - Codex, ZCode, Grok, Kilo, OpenCode totals verified identical to upstream.
-- Upstream fuzzy-matches exotic model names to catalog prices; rsusage marks
-  genuinely unpriced models `missingPricing` and reports cost 0 instead.
+- Pricing is deterministic: exact match, then first containment match in
+  sorted-key order; misses are memoized. Upstream 20.0.50 resolves a few
+  free-tier models (`deepseek-v4.1-flash-free` etc.) through its own
+  catalog-rules engine — rsusage marks those `missingPricing` and lists them
+  under `unpricedModels` in totals, matching upstream's field.
+- `--last N` is a period window ("most recent N periods": today/this
+  week/this month), matching upstream — weekly windows honor
+  `--start-of-week`. Week defaults: Sunday for `claude`, Monday otherwise.
+- A stored cost of `0` is treated as "not computed" (harnesses write it for
+  free-tier models), so cost falls back to catalog pricing in auto mode.
 - Session-row ordering is deterministic (first-activity) rather than
   upstream's filesystem-dependent order.

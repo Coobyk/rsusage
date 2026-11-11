@@ -1,9 +1,7 @@
 //! `--live`: a ratatui view that refreshes blocks on a timer.
 use crate::agents::AgentReader;
 use crate::cli::BlocksArgs;
-use crate::pricing::Pricing;
-use crate::report::{self, Ctx};
-use crate::types::UsageEntry;
+use crate::report::Ctx;
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block as RBlock, Borders, Paragraph};
@@ -11,8 +9,7 @@ use std::time::{Duration, Instant};
 
 pub fn run(
     readers: &[Box<dyn AgentReader>],
-    pricing: &Pricing,
-    tz: &jiff::tz::TimeZone,
+    ctx: &Ctx,
     args: &BlocksArgs,
     title: &str,
 ) -> anyhow::Result<()> {
@@ -22,33 +19,39 @@ pub fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let ctx = Ctx {
-        pricing,
-        mode: report::CostMode::Auto,
-        tz: tz.clone(),
-        merged: readers.len() > 1,
-        by_agent: true,
-        no_cost: args.report.no_cost,
-    };
+    let result = event_loop(&mut terminal, readers, ctx, args, title);
+    // always restore the terminal, even if the loop errored
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::LeaveAlternateScreen
+    );
+    result
+}
 
-    let mut entries: Vec<UsageEntry> = vec![];
+fn event_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    readers: &[Box<dyn AgentReader>],
+    ctx: &Ctx,
+    args: &BlocksArgs,
+    title: &str,
+) -> anyhow::Result<()> {
+    let mut entries = vec![];
     let mut last_load = Instant::now() - Duration::from_secs(10);
-    let result = loop {
-        // reload data every 3s
+    loop {
         if last_load.elapsed() > Duration::from_secs(3) {
-            let mut es: Vec<UsageEntry> = readers.iter().flat_map(|r| r.entries()).collect();
-            es = crate::agents::dedup(es);
-            entries = es;
+            entries = crate::app::load_entries(readers);
+            crate::app::apply_filters(&mut entries, &args.filter, &ctx.tz);
             last_load = Instant::now();
         }
         let now = jiff::Timestamp::now().as_millisecond();
-        let mut bl = report::blocks(&entries, args.session_length, now, pricing, tz);
-        if args.active {
-            bl.retain(|b| b.is_active);
-        }
-        let rows: Vec<crate::types::BlockRow> =
-            bl.iter().map(|b| crate::block_row(b, &ctx, args, now)).collect();
-        let text = crate::render::blocks_table(&rows, title, &[]);
+        let rows = crate::app::block_rows(&entries, args, ctx, now);
+        let detected = if ctx.merged {
+            crate::app::detected_names(&entries)
+        } else {
+            vec![]
+        };
+        let text = crate::render::blocks_table(&rows, title, ctx.merged, &detected);
         terminal.draw(|f| {
             let area = f.area();
             let p = Paragraph::new(text)
@@ -58,13 +61,13 @@ pub fn run(
         })?;
         if event::poll(Duration::from_millis(500))? {
             if let Event::Key(k) = event::read()? {
-                if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('c')) {
-                    break Ok(());
+                if matches!(
+                    k.code,
+                    KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('c')
+                ) {
+                    return Ok(());
                 }
             }
         }
-    };
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen)?;
-    result
+    }
 }
