@@ -26,7 +26,7 @@ enum Kind {
     Weekly,
     Monthly,
     Session,
-    Blocks(BlocksArgs),
+    Blocks(Box<BlocksArgs>),
     Statusline(StatusArgs),
 }
 
@@ -37,7 +37,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Some(Cmd::Weekly(a)) => run(Kind::Weekly, a, None),
         Some(Cmd::Monthly(a)) => run(Kind::Monthly, a, None),
         Some(Cmd::Session(a)) => run(Kind::Session, a, None),
-        Some(Cmd::Blocks(b)) => run(Kind::Blocks(b.clone()), &b.report, None),
+        Some(Cmd::Blocks(b)) => run(Kind::Blocks(Box::new(b.clone())), &b.report, None),
         Some(Cmd::Statusline(s)) => run_statusline(s, None),
         Some(other) => {
             let (id, nested) = agent_parts(other);
@@ -79,7 +79,7 @@ fn run_nested(agent_id: &'static str, nested: &Nested) -> anyhow::Result<()> {
         AgentCmd::Weekly(a) => (Kind::Weekly, a.clone()),
         AgentCmd::Monthly(a) => (Kind::Monthly, a.clone()),
         AgentCmd::Session(a) => (Kind::Session, a.clone()),
-        AgentCmd::Blocks(b) => (Kind::Blocks(b.clone()), b.report.clone()),
+        AgentCmd::Blocks(b) => (Kind::Blocks(Box::new(b.clone())), b.report.clone()),
         AgentCmd::Statusline(s) => (Kind::Statusline(s.clone()), ReportArgs::default()),
     };
     run(kind, &args, Some(agent_id))
@@ -148,7 +148,7 @@ fn run(kind: Kind, args: &ReportArgs, agent_id: Option<&'static str>) -> anyhow:
             } else {
                 "Session Blocks (All Agents) - Live"
             };
-            return live::run(&readers, &pricing, &tz, b, title);
+            return live::run(&readers, &pricing, &tz, b.as_ref(), title);
         }
     }
 
@@ -197,7 +197,7 @@ fn run(kind: Kind, args: &ReportArgs, agent_id: Option<&'static str>) -> anyhow:
     };
 
     match kind {
-        Kind::Blocks(b) => run_blocks(&entries, &ctx, &b, args, &detected),
+        Kind::Blocks(b) => run_blocks(&entries, &ctx, b.as_ref(), args, &detected),
         _ => run_period(kind, &entries, &ctx, args, &detected, merged, agent_id),
     }
     Ok(())

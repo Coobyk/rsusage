@@ -8,7 +8,7 @@ pub fn commas(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -322,7 +322,7 @@ impl ReportTable {
                                     .map(|m| format!("- {}", trunc(&m.model_name, MODELS_W - 2)))
                                     .collect();
                                 cells.push(Cell::multi(models, false));
-                                cells.extend(std::iter::repeat(Cell::r("")).take(6));
+                                cells.extend(std::iter::repeat_n(Cell::r(""), 6));
                                 trows.push(cells);
                             }
                         }
@@ -351,19 +351,6 @@ impl ReportTable {
         out.push_str(&table(vec![header], trows, &widths));
         out
     }
-}
-
-/// Session report table (per-agent or merged).
-pub fn session_table(title: &str, rows: &[Row], merged: bool, no_cost: bool, detected: &[String]) -> String {
-    ReportTable {
-        title: title.into(),
-        period_header: "Session".into(),
-        rows: rows.to_vec(),
-        merged,
-        no_cost,
-        detected: detected.to_vec(),
-    }
-    .render()
 }
 
 /// Blocks table.
