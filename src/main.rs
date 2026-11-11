@@ -13,6 +13,12 @@ use clap::{CommandFactory, FromArgMatches};
 use cli::*;
 use report::Report;
 
+// Short-lived, allocation-heavy process (bincode decode + JSON parse):
+// mimalloc beats the glibc allocator on small-alloc churn and has ~zero
+// init cost, unlike jemalloc's per-thread arenas.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     // clap `external_subcommand` catches `rsusage <agent> ...`; list the
     // known agents in help so they're still discoverable.

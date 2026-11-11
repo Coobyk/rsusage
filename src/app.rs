@@ -12,6 +12,16 @@ use crate::types::*;
 use clap::Parser;
 use rayon::prelude::*;
 
+fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
+    if std::env::var_os("RSUSAGE_TIMING").is_none() {
+        return f();
+    }
+    let t = std::time::Instant::now();
+    let r = f();
+    eprintln!("{label}: {:?}", t.elapsed());
+    r
+}
+
 /// Dispatch an agent-scoped invocation like `rsusage opencode daily --json`.
 pub fn run_agent(argv: &[String]) -> anyhow::Result<()> {
     let (id, rest) = argv.split_first().unwrap();
@@ -64,18 +74,22 @@ fn readers_for(agent_id: Option<&'static str>) -> Vec<Box<dyn AgentReader>> {
 
 /// Load entries across readers in parallel, dedup globally.
 pub(crate) fn load_entries(readers: &[Box<dyn AgentReader>]) -> Vec<UsageEntry> {
-    let loaded: Vec<Vec<UsageEntry>> = readers.par_iter().map(|r| r.entries()).collect();
+    let loaded: Vec<Vec<UsageEntry>> = readers
+        .par_iter()
+        .map(|r| timed(&format!("reader:{}", r.id()), || r.entries()))
+        .collect();
     agents::dedup(loaded.into_iter().flatten().collect())
 }
 
 /// Display names of the agents that produced entries (for "Detected:" banners).
 pub(crate) fn detected_names(entries: &[UsageEntry]) -> Vec<&'static str> {
+    let mut seen = rustc_hash::FxHashSet::default();
     let mut names: Vec<&'static str> = entries
         .iter()
+        .filter(|e| seen.insert(e.agent))
         .filter_map(|e| agents::display_for(e.agent))
         .collect();
     names.sort_unstable();
-    names.dedup();
     names
 }
 
@@ -134,17 +148,13 @@ pub(crate) fn apply_filters(
 /// Load + filter entries shared by period reports and blocks. Returns None
 /// when nothing is usable (message already printed).
 fn prepare(
+    readers: &[Box<dyn AgentReader>],
     agent_id: Option<&'static str>,
     f: &FilterArgs,
-) -> Option<(Vec<UsageEntry>, jiff::tz::TimeZone)> {
-    let readers = readers_for(agent_id);
-    if readers.is_empty() {
-        println!("No usage data found.");
-        return None;
-    }
-    let tz = tz_of(&f.timezone);
-    let mut entries = load_entries(&readers);
-    apply_filters(&mut entries, f, &tz);
+    tz: &jiff::tz::TimeZone,
+) -> Option<Vec<UsageEntry>> {
+    let mut entries = timed("load_entries", || load_entries(readers));
+    timed("filters", || apply_filters(&mut entries, f, tz));
     if entries.is_empty() {
         match agent_id {
             Some(_) => println!("No {} usage data found.", readers[0].display()),
@@ -152,7 +162,102 @@ fn prepare(
         }
         return None;
     }
-    Some((entries, tz))
+    Some(entries)
+}
+
+/// Signature of the pricing catalogs on disk — the same metadata the
+/// binary pricing cache validates against, so it tracks whatever
+/// `Pricing::load` resolved (including a just-fetched refresh).
+fn pricing_sig() -> String {
+    let dir = crate::paths::xdg_cache();
+    ["modelsdev_prices.json", "litellm_prices.json", "prices-bin-v1.cache"]
+        .iter()
+        .map(|f| {
+            std::fs::metadata(dir.join(f))
+                .ok()
+                .map(|m| {
+                    let ns = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    format!("{}:{ns}", m.len())
+                })
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Hash everything a report's bytes depend on: the command+args, the
+/// agent scope, the calendar bucket, the pricing catalogs and every
+/// reader's source signature. `None` when any reader can't sign its
+/// sources — unsigned sources make memoization unsafe.
+fn out_key(
+    tag: &str,
+    args_dbg: String,
+    agent_id: Option<&'static str>,
+    readers: &[Box<dyn AgentReader>],
+    bucket: &str,
+) -> Option<u64> {
+    let sigs: Option<Vec<String>> = readers.par_iter().map(|r| r.cache_key()).collect();
+    let mut h = rustc_hash::FxHasher::default();
+    use std::hash::Hasher;
+    h.write(tag.as_bytes());
+    h.write(args_dbg.as_bytes());
+    h.write(agent_id.unwrap_or("").as_bytes());
+    h.write(bucket.as_bytes());
+    h.write(pricing_sig().as_bytes());
+    h.write(std::env::var("TZ").unwrap_or_default().as_bytes());
+    for (r, s) in readers.iter().zip(sigs?) {
+        h.write(r.id().as_bytes());
+        h.write(s.as_bytes());
+    }
+    Some(h.finish())
+}
+
+/// Replay a previous run's exact bytes when every input signature still
+/// matches — the memo sits ABOVE the entry cache, so a hit skips
+/// decode+dedup+report+render entirely.
+fn emit_cached(key: Option<u64>, render: impl FnOnce() -> String) {
+    let path = key.map(|k| {
+        crate::paths::xdg_cache()
+            .join("out")
+            .join(format!("{k:016x}.bin"))
+    });
+    if let Some(p) = &path {
+        if let Ok(bytes) = std::fs::read(p) {
+            print!("{}", String::from_utf8_lossy(&bytes));
+            return;
+        }
+    }
+    let s = render();
+    if let Some(p) = path {
+        let dir = p.parent().unwrap();
+        if std::fs::create_dir_all(dir).is_ok() {
+            let tmp = p.with_extension("tmp");
+            if std::fs::write(&tmp, &s).is_ok() {
+                let _ = std::fs::rename(&tmp, &p);
+            }
+            // bound the dir: keys change whenever a source does, so stale
+            // files are never replayed — prune opportunistically on store
+            let cutoff = std::time::SystemTime::now()
+                - std::time::Duration::from_secs(24 * 3600);
+            if let Ok(files) = std::fs::read_dir(dir) {
+                for f in files.flatten() {
+                    let stale = f
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .is_ok_and(|t| t < cutoff);
+                    if stale {
+                        let _ = std::fs::remove_file(f.path());
+                    }
+                }
+            }
+        }
+    }
+    print!("{s}");
 }
 
 pub fn run_report(
@@ -161,12 +266,35 @@ pub fn run_report(
     agent_id: Option<&'static str>,
 ) -> anyhow::Result<()> {
     let f = &args.filter;
-    let Some((entries, tz)) = prepare(agent_id, f) else {
+    let offline = f.offline || f.no_cost;
+    let readers = readers_for(agent_id);
+    if readers.is_empty() {
+        println!("No usage data found.");
         return Ok(());
-    };
-    let pricing = Pricing::load(f.offline || f.no_cost);
-    let ctx = ctx_for(&pricing, f, tz, agent_id, args.start_of_week);
-    print_report(kind, &entries, &ctx, args, agent_id);
+    }
+    let tz = tz_of(&f.timezone);
+    let pricing = timed("pricing_load", || Pricing::load(offline));
+    let day = jiff::Zoned::now()
+        .with_time_zone(tz.clone())
+        .date()
+        .to_string();
+    let key = out_key(
+        &format!("{kind:?}"),
+        format!("{args:?}"),
+        agent_id,
+        &readers,
+        &day,
+    );
+    emit_cached(key, || {
+        let Some(entries) = prepare(&readers, agent_id, f, &tz) else {
+            return match agent_id {
+                Some(_) => format!("No {} usage data found.\n", readers[0].display()),
+                None => "No usage data found.\n".to_string(),
+            };
+        };
+        let ctx = ctx_for(&pricing, f, tz.clone(), agent_id, args.start_of_week);
+        timed("render", || render_report(kind, &entries, &ctx, args, agent_id))
+    });
     Ok(())
 }
 
@@ -181,13 +309,13 @@ fn title_of(kind: Report, agent_id: Option<&'static str>) -> String {
     }
 }
 
-fn print_report(
+fn render_report(
     kind: Report,
     entries: &[UsageEntry],
     ctx: &Ctx,
     args: &ReportArgs,
     agent_id: Option<&'static str>,
-) {
+) -> String {
     let f = &args.filter;
     let sections: Vec<Report> = match &args.sections {
         Some(list) => list
@@ -222,7 +350,7 @@ fn print_report(
         } else {
             entries
         };
-        let mut rows = k.rows(slice, ctx);
+        let mut rows = timed("rows", || k.rows(slice, ctx));
         if f.order == Order::Desc {
             rows.reverse();
         }
@@ -298,12 +426,12 @@ fn print_report(
         }
     }
     if f.json {
-        println!(
-            "{}",
+        format!(
+            "{}\n",
             serde_json::to_string_pretty(&serde_json::Value::Object(json_out)).unwrap()
-        );
+        )
     } else {
-        print!("{table_out}");
+        table_out
     }
 }
 
@@ -317,6 +445,8 @@ fn blocks_title(agent_id: Option<&'static str>, live: bool) -> &'static str {
 
 pub fn run_blocks(b: &BlocksArgs, agent_id: Option<&'static str>) -> anyhow::Result<()> {
     let f = &b.filter;
+    let offline = f.offline || f.no_cost;
+    let pricing_handle = std::thread::spawn(move || Pricing::load(offline));
     if b.live {
         let readers = readers_for(agent_id);
         if readers.is_empty() {
@@ -324,36 +454,54 @@ pub fn run_blocks(b: &BlocksArgs, agent_id: Option<&'static str>) -> anyhow::Res
             return Ok(());
         }
         let tz = tz_of(&f.timezone);
-        let pricing = Pricing::load(f.offline || f.no_cost);
+        let pricing = pricing_handle.join().unwrap();
         let ctx = ctx_for(&pricing, f, tz.clone(), agent_id, None);
         let title = blocks_title(agent_id, true);
         return live::run(&readers, &ctx, b, title);
     }
-    let Some((entries, tz)) = prepare(agent_id, f) else {
+    let readers = readers_for(agent_id);
+    if readers.is_empty() {
+        println!("No usage data found.");
         return Ok(());
-    };
-    let pricing = Pricing::load(f.offline || f.no_cost);
-    let ctx = ctx_for(&pricing, f, tz, agent_id, None);
+    }
+    let tz = tz_of(&f.timezone);
+    let pricing = pricing_handle.join().unwrap();
+    // blocks render now-derived fields (elapsed, projections) — bucket the
+    // memo key at 60s so a replay is never more than a minute stale
     let now = jiff::Timestamp::now().as_millisecond();
-    let rows = block_rows(&entries, b, &ctx, now);
-    if f.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "blocks": rows })).unwrap()
-        );
-    } else if rows.is_empty() {
-        println!("No usage blocks found.");
-    } else {
-        print!(
-            "{}",
+    let minute = (now / 60_000).to_string();
+    let key = out_key(
+        "blocks",
+        format!("{b:?}"),
+        agent_id,
+        &readers,
+        &minute,
+    );
+    emit_cached(key, || {
+        let Some(entries) = prepare(&readers, agent_id, f, &tz) else {
+            return match agent_id {
+                Some(_) => format!("No {} usage data found.\n", readers[0].display()),
+                None => "No usage data found.\n".to_string(),
+            };
+        };
+        let ctx = ctx_for(&pricing, f, tz.clone(), agent_id, None);
+        let rows = block_rows(&entries, b, &ctx, now);
+        if f.json {
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&serde_json::json!({ "blocks": rows })).unwrap()
+            )
+        } else if rows.is_empty() {
+            "No usage blocks found.\n".to_string()
+        } else {
             render::blocks_table(
                 &rows,
                 blocks_title(agent_id, false),
                 ctx.merged,
-                &detected_names(&entries)
+                &detected_names(&entries),
             )
-        );
-    }
+        }
+    });
     Ok(())
 }
 
@@ -382,8 +530,10 @@ pub(crate) fn block_rows(
 }
 
 pub fn run_statusline(s: &StatusArgs, agent_id: Option<&'static str>) -> anyhow::Result<()> {
+    let offline = s.offline;
+    let pricing_handle = std::thread::spawn(move || Pricing::load(offline));
     let readers = readers_for(agent_id);
-    let pricing = Pricing::load(s.offline);
+    let pricing = pricing_handle.join().unwrap();
     statusline::run(&readers, &pricing, &tz_of(&s.timezone), s.json);
     Ok(())
 }

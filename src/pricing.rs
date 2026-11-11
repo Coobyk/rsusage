@@ -7,8 +7,13 @@ const MODELSDEV_URL: &str = "https://models.dev/api.json";
 const LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 const CACHE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+const BIN_FILE: &str = "prices-bin-v1.cache";
+/// Bump if the source set/order or the serialized map layout changes.
+const BIN_VERSION: u32 = 1;
+/// (mtime_secs, mtime_nanos, len) per source, in load order.
+type SourceMeta = [(u64, u32, u64); 2];
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Price {
     pub input: f64,
     pub output: f64,
@@ -38,30 +43,70 @@ fn cache_dir() -> PathBuf {
     crate::paths::xdg_cache()
 }
 
-fn fetch_cached(url: &str, file: &str, offline: bool) -> Option<String> {
+/// Re-download a cached JSON source if stale; offline skips the network.
+fn refresh(url: &str, file: &str, offline: bool) {
     let path = cache_dir().join(file);
     let fresh = std::fs::metadata(&path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
         .is_some_and(|e| e.as_secs() < CACHE_MAX_AGE_SECS);
-    if !offline && !fresh {
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(15)))
-            .build()
-            .new_agent();
-        if let Ok(text) = agent
-            .get(url)
-            .call()
-            .and_then(|mut r| r.body_mut().read_to_string())
-        {
-            if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
-                let _ = std::fs::create_dir_all(cache_dir());
-                let _ = std::fs::write(&path, &text);
-            }
+    if offline || fresh {
+        return;
+    }
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(15)))
+        .build()
+        .new_agent();
+    if let Ok(text) = agent
+        .get(url)
+        .call()
+        .and_then(|mut r| r.body_mut().read_to_string())
+    {
+        if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
+            let _ = std::fs::create_dir_all(cache_dir());
+            let _ = std::fs::write(&path, &text);
         }
     }
-    std::fs::read_to_string(&path).ok()
+}
+
+fn read_cached(file: &str) -> Option<String> {
+    std::fs::read_to_string(cache_dir().join(file)).ok()
+}
+
+fn meta_of(path: &std::path::Path) -> (u64, u32, u64) {
+    let Ok(m) = std::fs::metadata(path) else {
+        return (0, 0, 0);
+    };
+    let d = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .unwrap_or_default();
+    (d.as_secs(), d.subsec_nanos(), m.len())
+}
+
+fn source_meta() -> SourceMeta {
+    ["modelsdev_prices.json", "litellm_prices.json"].map(|f| meta_of(&cache_dir().join(f)))
+}
+
+/// Binary cache blob: (version, source meta, map). Used only when every
+/// source file's metadata still matches; any mismatch/corruption falls
+/// back to JSON parsing.
+fn read_bin(meta: &SourceMeta) -> Option<BTreeMap<String, Price>> {
+    let bytes = std::fs::read(cache_dir().join(BIN_FILE)).ok()?;
+    let (v, m, map): (u32, SourceMeta, BTreeMap<String, Price>) =
+        bincode::deserialize(&bytes).ok()?;
+    (v == BIN_VERSION && m == *meta).then_some(map)
+}
+
+fn write_bin(meta: &SourceMeta, map: &BTreeMap<String, Price>) {
+    if let Ok(bytes) = bincode::serialize(&(BIN_VERSION, meta, map)) {
+        let tmp = cache_dir().join("prices-bin.tmp");
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, cache_dir().join(BIN_FILE));
+        }
+    }
 }
 
 /// Normalize a model id for lookup: lowercase, strip provider prefix,
@@ -79,10 +124,25 @@ fn norm(model: &str) -> String {
 
 impl Pricing {
     pub fn load(offline: bool) -> Self {
+        refresh(MODELSDEV_URL, "modelsdev_prices.json", offline);
+        refresh(LITELLM_URL, "litellm_prices.json", offline);
+        let meta = source_meta();
+        let map = read_bin(&meta).unwrap_or_else(|| {
+            let map = Self::parse_sources();
+            write_bin(&meta, &map);
+            map
+        });
+        Self {
+            map,
+            cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// models.dev first (per-1M-token costs -> per-token); canonical
+    /// providers before resellers so their prices win the first-writer-wins
+    /// insert (bedrock/openrouter add markup). LiteLLM fills the gaps.
+    fn parse_sources() -> BTreeMap<String, Price> {
         let mut map = BTreeMap::new();
-        // models.dev first (per-1M-token costs -> per-token); canonical
-        // providers before resellers so their prices win the first-writer-wins
-        // insert (bedrock/openrouter add markup).
         const PRIORITY: &[&str] = &[
             "anthropic",
             "openai",
@@ -98,7 +158,7 @@ impl Pricing {
             "moonshot",
             "qwen",
         ];
-        if let Some(text) = fetch_cached(MODELSDEV_URL, "modelsdev_prices.json", offline) {
+        if let Some(text) = read_cached("modelsdev_prices.json") {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                 if let Some(providers) = v.as_object() {
                     let mut order: Vec<&String> = providers.keys().collect();
@@ -132,7 +192,7 @@ impl Pricing {
             }
         }
         // LiteLLM fills whatever models.dev doesn't cover
-        if let Some(text) = fetch_cached(LITELLM_URL, "litellm_prices.json", offline) {
+        if let Some(text) = read_cached("litellm_prices.json") {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                 if let Some(obj) = v.as_object() {
                     for (name, p) in obj {
@@ -147,10 +207,7 @@ impl Pricing {
                 }
             }
         }
-        Self {
-            map,
-            cache: std::cell::RefCell::new(std::collections::HashMap::new()),
-        }
+        map
     }
 
     pub fn get(&self, model: &str) -> Option<Price> {

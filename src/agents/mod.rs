@@ -3,7 +3,9 @@ mod sqlite;
 
 use crate::paths;
 use crate::types::UsageEntry;
+use rayon::prelude::*;
 use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 
 /// A usage data source for one coding agent.
@@ -14,6 +16,12 @@ pub trait AgentReader: Send + Sync {
     fn detect(&self) -> bool;
     /// All usage entries, unfiltered. Caller dedups globally.
     fn entries(&self) -> Vec<UsageEntry>;
+    /// A signature covering everything `entries` could read — the same
+    /// stats the entry cache trusts. `None` means the source can't be
+    /// signed, so output can't be memoized.
+    fn cache_key(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Recursively collect files matching a predicate.
@@ -81,19 +89,72 @@ fn strv<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }
 
+/// FxHash (rustc's old hasher): rotate-xor-multiply per 8-byte chunk.
+/// SipHash is overkill for in-process dedup keys.
+#[derive(Default)]
+struct FxHasher(u64);
+
+impl Hasher for FxHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for c in bytes.chunks(8) {
+            let mut b = [0u8; 8];
+            b[..c.len()].copy_from_slice(c);
+            self.write_u64(u64::from_le_bytes(b));
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517cc1b727220a95);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
+
+/// Hash the dedup identity — the same logical key as `format!("{agent}:{key}")`
+/// (lengths mixed in so field boundaries can't shift), as a u64.
+/// `nz` remaps the (2^-64) 0 result to 1 so 0 can mean "no precomputed id".
+pub(crate) fn dedup_hash(agent: &str, key: &[u8]) -> u64 {
+    let mut h = FxHasher::default();
+    h.write_usize(agent.len());
+    h.write(agent.as_bytes());
+    h.write_usize(key.len());
+    h.write(key);
+    match h.finish() {
+        0 => 1,
+        h => h,
+    }
+}
+
 /// Globally dedup entries by `agent:dedup_key`. Empty keys are always unique.
+/// Hashing the string keys is the bulk of the work, so that runs in
+/// parallel; the u64 set pass below is identical to the old sequential one —
+/// same first-occurrence-wins, same output order.
 pub fn dedup(entries: Vec<UsageEntry>) -> Vec<UsageEntry> {
-    let mut seen = HashSet::with_capacity(entries.len());
-    let mut out = Vec::with_capacity(entries.len());
-    let mut anon = 0u64;
-    for e in entries {
-        let key = if e.dedup_key.is_empty() {
-            anon += 1;
-            format!("{}:anon:{}", e.agent, anon)
-        } else {
-            format!("{}:{}", e.agent, e.dedup_key)
-        };
-        if seen.insert(key) {
+    let hashes: Vec<u64> = entries
+        .par_iter()
+        .enumerate()
+        .map(|(i, e)| {
+            // cached entries carry their hash; only fresh scans need the
+            // string hashed — and "empty key" can only ever come from them
+            if e.dedup_id != 0 {
+                e.dedup_id
+            } else if e.dedup_key.is_empty() {
+                // index-keyed — unique per entry, same as the old `anon`
+                // counter (values differ, uniqueness is what matters)
+                dedup_hash(e.agent, format!("anon:{i}").as_bytes())
+            } else {
+                dedup_hash(e.agent, e.dedup_key.as_bytes())
+            }
+        })
+        .collect();
+    let mut seen: HashSet<u64, BuildHasherDefault<FxHasher>> =
+        HashSet::with_capacity_and_hasher(hashes.len(), Default::default());
+    let mut out = Vec::with_capacity(hashes.len());
+    for (e, h) in entries.into_iter().zip(hashes) {
+        if seen.insert(h) {
             out.push(e);
         }
     }
@@ -289,7 +350,8 @@ mod tests {
             tokens: Tokens::default(),
             cost_usd: None,
             dedup_key: key.into(),
-            project: String::new(),
+            dedup_id: 0,
+            project: "".into(),
         }
     }
 

@@ -1,3 +1,4 @@
+use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 
 /// Model name used when a source doesn't record one.
@@ -41,6 +42,9 @@ impl Tokens {
 }
 
 /// One billable event: a single model request / turn with token usage.
+///
+/// Strings are `Arc<str>` so the entry cache can intern them — a model name
+/// shared by 100k entries costs one allocation, not 100k.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UsageEntry {
     /// agent id: "claude", "codex", "opencode", "devin", ...
@@ -50,30 +54,21 @@ pub struct UsageEntry {
     /// unix epoch millis (UTC)
     pub timestamp_ms: i64,
     /// session/conversation identifier
-    pub session_id: String,
+    pub session_id: std::sync::Arc<str>,
     /// model name as reported by the harness
-    pub model: String,
+    pub model: std::sync::Arc<str>,
     pub tokens: Tokens,
     /// cost reported by the harness itself, if any (display mode)
     pub cost_usd: Option<f64>,
     /// dedup key (e.g. messageId:requestId); entries with identical keys are skipped
-    pub dedup_key: String,
+    pub dedup_key: std::sync::Arc<str>,
+    /// precomputed `agent:key` dedup hash; nonzero means "trust me, skip hashing
+    /// and the empty-key check" — the entry cache stores this so decode never
+    /// needs the key string itself
+    #[serde(skip)]
+    pub dedup_id: u64,
     /// working directory / project label, best effort
-    pub project: String,
-}
-
-impl UsageEntry {
-    /// Serialize minus `agent` for the entry cache (agent re-attached on read).
-    pub fn cache_blob(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
-    }
-
-    /// Rebuild from a cache row, attaching the agent the cache belongs to.
-    pub fn from_cache_blob(b: &[u8], agent: &'static str) -> Option<Self> {
-        let mut e: Self = bincode::deserialize(b).ok()?;
-        e.agent = agent;
-        Some(e)
-    }
+    pub project: std::sync::Arc<str>,
 }
 
 /// Per-model aggregate inside a report row.
@@ -94,8 +89,8 @@ pub struct ModelAgg {
 #[derive(Debug, Clone, Default)]
 pub struct Acc {
     pub tokens: Tokens,
-    /// model -> ModelAgg
-    pub models: BTreeMap<String, ModelAgg>,
+    /// model -> ModelAgg (unordered; consumers sort by name for output)
+    pub models: FxHashMap<String, ModelAgg>,
     /// first-seen model order (ccusage keeps insertion order in modelsUsed)
     pub model_order: Vec<String>,
     /// agent -> per-agent aggregates (one level deep only)
@@ -110,29 +105,54 @@ pub struct Acc {
 #[derive(Debug, Clone, Default)]
 pub struct AgentAcc {
     pub tokens: Tokens,
-    pub models: BTreeMap<String, ModelAgg>,
+    pub models: FxHashMap<String, ModelAgg>,
     pub entry_count: u64,
 }
 
 impl Acc {
     pub fn add(&mut self, e: &UsageEntry, pricing: &crate::pricing::Pricing) {
+        self.add_costed(e, pricing.entry_cost(e), true);
+    }
+
+    /// `add` with the catalog cost already resolved (`pricing.entry_cost`)
+    /// and agent slices optional — only merged reports read `agents`.
+    pub fn add_costed(&mut self, e: &UsageEntry, calc: Option<f64>, track_agents: bool) {
         // a stored cost of 0 means "not computed" (harnesses write it for
         // free-tier models) — auto mode must fall back to the catalog price
         let stored = e.cost_usd.filter(|&c| c != 0.0);
-        let calc = pricing.entry_cost(e);
         let auto = stored.or(calc).unwrap_or(0.0);
         self.tokens += e.tokens;
         self.entry_count += 1;
-        if !self.models.contains_key(&e.model) {
-            self.model_order.push(e.model.clone());
+        match self.models.get_mut(e.model.as_ref()) {
+            Some(m) => add_costs(m, e, stored, calc, auto),
+            None => {
+                self.model_order.push(e.model.to_string());
+                add_costs(
+                    self.models.entry(e.model.to_string()).or_default(),
+                    e,
+                    stored,
+                    calc,
+                    auto,
+                );
+            }
         }
-        let m = self.models.entry(e.model.clone()).or_default();
-        add_costs(m, e, stored, calc, auto);
-        let a = self.agents.entry(e.agent).or_default();
-        a.tokens += e.tokens;
-        a.entry_count += 1;
+        if track_agents {
+            let a = self.agents.entry(e.agent).or_default();
+            a.tokens += e.tokens;
+            a.entry_count += 1;
+            match a.models.get_mut(e.model.as_ref()) {
+                Some(m) => add_costs(m, e, stored, calc, auto),
+                None => add_costs(
+                    a.models.entry(e.model.to_string()).or_default(),
+                    e,
+                    stored,
+                    calc,
+                    auto,
+                ),
+            }
+        }
         if self.project.is_empty() && !e.project.is_empty() {
-            self.project = e.project.clone();
+            self.project = e.project.to_string();
         }
         if self.last_activity_ms == 0 || e.timestamp_ms > self.last_activity_ms {
             self.last_activity_ms = e.timestamp_ms;
@@ -140,13 +160,6 @@ impl Acc {
         if self.first_activity_ms == 0 || e.timestamp_ms < self.first_activity_ms {
             self.first_activity_ms = e.timestamp_ms;
         }
-        add_costs(
-            a.models.entry(e.model.clone()).or_default(),
-            e,
-            stored,
-            calc,
-            auto,
-        );
     }
 
     pub fn total(&self) -> u64 {
@@ -335,8 +348,9 @@ mod tests {
             model: "m".into(),
             tokens,
             cost_usd: None,
-            dedup_key: String::new(),
-            project: String::new(),
+            dedup_key: "".into(),
+            dedup_id: 0,
+            project: "".into(),
         }
     }
 
@@ -354,20 +368,6 @@ mod tests {
         assert_eq!(t.total_no_reasoning(), 27);
         assert!(!t.is_zero());
         assert!(Tokens::default().is_zero());
-    }
-
-    #[test]
-    fn cache_blob_roundtrip() {
-        let e = entry("devin", Tokens::default());
-        let blob = e.cache_blob();
-        let back = UsageEntry::from_cache_blob(&blob, "devin").unwrap();
-        assert_eq!(back.agent, "devin");
-        assert_eq!(back.timestamp_ms, e.timestamp_ms);
-        assert_eq!(back.tokens, e.tokens);
-        assert_eq!(back.dedup_key, e.dedup_key);
-        // agent comes from the cache table, not the blob
-        let renamed = UsageEntry::from_cache_blob(&blob, "kilo").unwrap();
-        assert_eq!(renamed.agent, "kilo");
     }
 
     #[test]

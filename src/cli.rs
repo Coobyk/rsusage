@@ -56,14 +56,14 @@ pub enum AgentCmd {
     Statusline(StatusArgs),
 }
 
-#[derive(Clone, Copy, Default, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, ValueEnum)]
 pub enum Order {
     #[default]
     Asc,
     Desc,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Weekday {
     Sunday,
     Monday,
@@ -90,7 +90,7 @@ impl Weekday {
 }
 
 /// Flags every report-like command shares.
-#[derive(Args, Clone, Default)]
+#[derive(Args, Clone, Debug, Default)]
 pub struct FilterArgs {
     /// Output in JSON format
     #[arg(short = 'j', long)]
@@ -158,7 +158,7 @@ pub struct FilterArgs {
 }
 
 /// Period-report flags (daily/weekly/monthly/session).
-#[derive(Args, Clone, Default)]
+#[derive(Args, Clone, Debug, Default)]
 pub struct ReportArgs {
     #[command(flatten)]
     pub filter: FilterArgs,
@@ -173,7 +173,7 @@ pub struct ReportArgs {
     pub start_of_week: Option<Weekday>,
 }
 
-#[derive(Args, Clone, Default)]
+#[derive(Args, Clone, Debug, Default)]
 pub struct BlocksArgs {
     #[command(flatten)]
     pub filter: FilterArgs,

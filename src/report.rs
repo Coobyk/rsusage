@@ -1,10 +1,11 @@
 //! Aggregation: period bucketing, session grouping, 5h blocks, cost modes.
 
-use crate::pricing::Pricing;
+use crate::pricing::{Price, Pricing};
 use crate::types::*;
+use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Default, PartialEq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, clap::ValueEnum)]
 pub enum CostMode {
     /// stored cost when present, else calculated
     #[default]
@@ -16,7 +17,7 @@ pub enum CostMode {
 }
 
 /// Which report section to produce. `--sections` parses with `from_name`.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Report {
     Daily,
     Weekly,
@@ -66,9 +67,14 @@ impl Report {
     /// Group entries into this report's rows.
     pub fn rows(&self, entries: &[UsageEntry], ctx: &Ctx) -> Vec<Row> {
         match self {
-            Self::Daily => group_by(entries, ctx, date_key),
-            Self::Weekly => group_by(entries, ctx, |ms, tz| week_key_sow(ms, tz, ctx.sow)),
-            Self::Monthly => group_by(entries, ctx, month_key),
+            Self::Daily => group_by(entries, ctx, |d| d, |d| d.to_string()),
+            Self::Weekly => group_by(entries, ctx, |d| week_start(d, ctx.sow), |d| d.to_string()),
+            Self::Monthly => group_by(
+                entries,
+                ctx,
+                |d| jiff::civil::date(d.year(), d.month(), 1),
+                |d| format!("{}-{:02}", d.year(), d.month()),
+            ),
             Self::Session => group_session(entries, ctx),
         }
     }
@@ -123,13 +129,16 @@ impl<'a> Ctx<'a> {
 
     /// Total cost of a whole accumulator.
     pub fn acc_cost(&self, acc: &Acc) -> f64 {
-        acc.models.iter().map(|(n, m)| self.cost(n, m).0).sum()
+        sorted_models(&acc.models)
+            .into_iter()
+            .map(|(n, m)| self.cost(n, m).0)
+            .sum()
     }
 
     pub fn row(&self, period: String, acc: &Acc) -> Row {
         let mut breakdowns = vec![];
         let mut total_cost = 0.0;
-        for (name, m) in &acc.models {
+        for (name, m) in sorted_models(&acc.models) {
             let (cost, missing) = self.cost(name, m);
             total_cost += cost;
             breakdowns.push(ModelRow {
@@ -164,7 +173,10 @@ impl<'a> Ctx<'a> {
                         cache_creation_tokens: a.tokens.cache_creation,
                         cache_read_tokens: a.tokens.cache_read,
                         total_tokens: a.tokens.total(),
-                        total_cost: a.models.iter().map(|(n, m)| self.cost(n, m).0).sum(),
+                        total_cost: sorted_models(&a.models)
+                            .into_iter()
+                            .map(|(n, m)| self.cost(n, m).0)
+                            .sum(),
                         models_used: mu,
                     }
                 })
@@ -344,28 +356,6 @@ pub fn date_key(ms: i64, tz: &jiff::tz::TimeZone) -> String {
         .unwrap_or_default()
 }
 
-/// Week-start key. `sow` = weekday index (Sunday=0 .. Saturday=6).
-pub fn week_key_sow(ms: i64, tz: &jiff::tz::TimeZone, sow: i64) -> String {
-    jiff::Timestamp::from_millisecond(ms)
-        .map(|t| {
-            let d = t.to_zoned(tz.clone()).date();
-            let back = (i64::from(d.weekday().to_sunday_zero_offset()) - sow).rem_euclid(7);
-            d.checked_sub(jiff::SignedDuration::from_hours(24 * back))
-                .map(|w| w.to_string())
-                .unwrap_or_else(|_| d.to_string())
-        })
-        .unwrap_or_default()
-}
-
-pub fn month_key(ms: i64, tz: &jiff::tz::TimeZone) -> String {
-    jiff::Timestamp::from_millisecond(ms)
-        .map(|t| {
-            let d = t.to_zoned(tz.clone()).date();
-            format!("{}-{:02}", d.year(), d.month())
-        })
-        .unwrap_or_default()
-}
-
 /// `--last N` is a period window, not a row count: "most recent N periods"
 /// where 1 means today / this week (aligned to `sow`) / this month. Session
 /// has no upstream counterpart; a day window is the sensible analog.
@@ -393,31 +383,151 @@ pub fn last_since(k: &Report, n: u32, ctx: &Ctx) -> i64 {
         .unwrap_or(i64::MIN)
 }
 
-/// Group entries into period buckets and build rows.
-fn group_by<F>(entries: &[UsageEntry], ctx: &Ctx, key: F) -> Vec<Row>
-where
-    F: Fn(i64, &jiff::tz::TimeZone) -> String,
-{
-    let mut accs: BTreeMap<String, Acc> = BTreeMap::new();
-    for e in entries {
-        accs.entry(key(e.timestamp_ms, &ctx.tz))
-            .or_default()
-            .add(e, ctx.pricing);
+/// Model map in name order: `models` is an unordered FxHashMap but every
+/// consumer needs the old BTreeMap (alphabetical) sequence — identical f64
+/// add order for cost sums, identical tie order for stable-sorted rows.
+fn sorted_models(m: &FxHashMap<String, ModelAgg>) -> Vec<(&String, &ModelAgg)> {
+    let mut v: Vec<_> = m.iter().collect();
+    v.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    v
+}
+
+/// `Pricing::entry_cost` with the unit price already resolved — identical
+/// f64 expression so results (and rounding) match exactly.
+#[inline]
+fn unit_cost(e: &UsageEntry, p: &Price) -> f64 {
+    e.tokens.input as f64 * p.input
+        + e.tokens.output as f64 * p.output
+        + e.tokens.cache_creation as f64 * p.cache_creation
+        + e.tokens.cache_read as f64 * p.cache_read
+}
+
+/// Week-start canon. `sow` = weekday index (Sunday=0 .. Saturday=6).
+fn week_start(d: jiff::civil::Date, sow: i64) -> jiff::civil::Date {
+    let back = (i64::from(d.weekday().to_sunday_zero_offset()) - sow).rem_euclid(7);
+    d.checked_sub(jiff::SignedDuration::from_hours(24 * back))
+        .unwrap_or(d)
+}
+
+/// Chronological packing of a civil date (ordering preserved).
+fn pack(d: jiff::civil::Date) -> i64 {
+    (i64::from(d.year()) << 16) | (i64::from(d.month()) << 8) | i64::from(d.day())
+}
+
+/// ms -> local civil-date lookup. Local days partition the timeline into
+/// [midnight, next-midnight) intervals; caching them makes a hit a couple
+/// of integer compares instead of a tz resolution + date conversion.
+struct DayCache {
+    tz: jiff::tz::TimeZone,
+    days: BTreeMap<i64, (i64, jiff::civil::Date)>,
+    last: Option<(i64, i64, jiff::civil::Date)>,
+}
+
+impl DayCache {
+    fn new(tz: jiff::tz::TimeZone) -> Self {
+        Self {
+            tz,
+            days: BTreeMap::new(),
+            last: None,
+        }
     }
-    accs.iter().map(|(k, a)| ctx.row(k.clone(), a)).collect()
+
+    /// ms at local midnight for a civil date.
+    fn midnight_ms(d: jiff::civil::Date, tz: &jiff::tz::TimeZone) -> Option<i64> {
+        d.to_datetime(jiff::civil::Time::midnight())
+            .to_zoned(tz.clone())
+            .ok()
+            .map(|z| z.timestamp().as_millisecond())
+    }
+
+    fn date(&mut self, ms: i64) -> Option<jiff::civil::Date> {
+        if let Some((lo, hi, d)) = self.last {
+            if ms >= lo && ms < hi {
+                return Some(d);
+            }
+        }
+        if let Some((&lo, &(hi, d))) = self.days.range(..=ms).next_back() {
+            if ms < hi {
+                self.last = Some((lo, hi, d));
+                return Some(d);
+            }
+        }
+        let d = jiff::Timestamp::from_millisecond(ms)
+            .ok()?
+            .to_zoned(self.tz.clone())
+            .date();
+        let next = d.checked_add(jiff::SignedDuration::from_hours(24)).ok();
+        if let (Some(lo), Some(hi)) = (
+            Self::midnight_ms(d, &self.tz),
+            next.and_then(|n| Self::midnight_ms(n, &self.tz)),
+        ) {
+            if lo < hi {
+                self.days.insert(lo, (hi, d));
+                self.last = Some((lo, hi, d));
+            }
+        }
+        Some(d)
+    }
+}
+
+/// Group entries into period buckets and build rows. `canon` maps a local
+/// date to its bucket's canonical date; `fmt` renders it into the period
+/// key (once per bucket, not per entry).
+fn group_by<C, F>(entries: &[UsageEntry], ctx: &Ctx, canon: C, fmt: F) -> Vec<Row>
+where
+    C: Fn(jiff::civil::Date) -> jiff::civil::Date,
+    F: Fn(&jiff::civil::Date) -> String,
+{
+    let mut days = DayCache::new(ctx.tz.clone());
+    let mut idx: FxHashMap<i64, u32> = FxHashMap::default();
+    let mut accs: Vec<(jiff::civil::Date, Acc)> = Vec::new();
+    let mut bad = Acc::default();
+    let mut prices: FxHashMap<&str, Option<Price>> = FxHashMap::default();
+    for e in entries {
+        let calc = prices
+            .entry(e.model.as_ref())
+            .or_insert_with(|| ctx.pricing.get(&e.model))
+            .as_ref()
+            .map(|p| unit_cost(e, p));
+        let Some(d) = days.date(e.timestamp_ms) else {
+            bad.add_costed(e, calc, ctx.merged);
+            continue;
+        };
+        let cd = canon(d);
+        let i = *idx.entry(pack(cd)).or_insert_with(|| {
+            let i = accs.len() as u32;
+            accs.push((cd, Acc::default()));
+            i
+        });
+        accs[i as usize].1.add_costed(e, calc, ctx.merged);
+    }
+    accs.sort_unstable_by_key(|(d, _)| pack(*d));
+    let mut rows = Vec::with_capacity(accs.len() + (bad.entry_count > 0) as usize);
+    if bad.entry_count > 0 {
+        // unconvertible timestamps bucketted under "" — sorts first
+        rows.push(ctx.row(String::new(), &bad));
+    }
+    rows.extend(accs.iter().map(|(d, a)| ctx.row(fmt(d), a)));
+    rows
 }
 
 /// Group by session id; upstream orders sessions by first activity.
 fn group_session(entries: &[UsageEntry], ctx: &Ctx) -> Vec<Row> {
-    let mut accs: std::collections::HashMap<String, Acc> = Default::default();
+    let mut accs: FxHashMap<&str, Acc> = FxHashMap::default();
+    let mut prices: FxHashMap<&str, Option<Price>> = FxHashMap::default();
     for e in entries {
-        accs.entry(e.session_id.clone())
+        let calc = prices
+            .entry(e.model.as_ref())
+            .or_insert_with(|| ctx.pricing.get(&e.model))
+            .as_ref()
+            .map(|p| unit_cost(e, p));
+        accs.entry(e.session_id.as_ref())
             .or_default()
-            .add(e, ctx.pricing);
+            .add_costed(e, calc, ctx.merged);
     }
     let mut rows: Vec<(i64, Row)> = accs
         .iter()
-        .map(|(k, a)| (a.first_activity_ms, ctx.session_row(k.clone(), a)))
+        .map(|(k, a)| (a.first_activity_ms, ctx.session_row((*k).to_string(), a)))
         .collect();
     rows.sort_by_key(|(t, _)| *t);
     rows.into_iter().map(|(_, r)| r).collect()
@@ -440,6 +550,7 @@ pub fn blocks(
 
     let mut out: Vec<Block> = Vec::new();
     let mut cur: Option<Block> = None;
+    let mut prices: FxHashMap<&str, Option<Price>> = FxHashMap::default();
     for e in sorted {
         let open_new = match &cur {
             None => true,
@@ -458,7 +569,12 @@ pub fn blocks(
                 is_active: now_ms < end,
             });
         }
-        cur.as_mut().unwrap().acc.add(e, pricing);
+        let calc = prices
+            .entry(e.model.as_ref())
+            .or_insert_with(|| pricing.get(&e.model))
+            .as_ref()
+            .map(|p| unit_cost(e, p));
+        cur.as_mut().unwrap().acc.add_costed(e, calc, false);
     }
     if let Some(b) = cur.take() {
         out.push(b);
@@ -571,8 +687,9 @@ mod tests {
                 ..Default::default()
             },
             cost_usd: None,
-            dedup_key: String::new(),
-            project: String::new(),
+            dedup_key: "".into(),
+            dedup_id: 0,
+            project: "".into(),
         }
     }
 
@@ -604,27 +721,16 @@ mod tests {
     #[test]
     fn week_key_respects_start_of_week() {
         // 2026-11-11 is a Wednesday
-        let tz = jiff::tz::TimeZone::UTC;
-        let wed = jiff::civil::date(2026, 11, 11)
-            .at(12, 0, 0, 0)
-            .to_zoned(tz.clone())
-            .unwrap()
-            .timestamp()
-            .as_millisecond();
+        let wed = jiff::civil::date(2026, 11, 11);
         // monday-start week containing a Wednesday begins Monday 11-09
-        assert_eq!(week_key_sow(wed, &tz, 1), "2026-11-09");
+        assert_eq!(week_start(wed, 1), jiff::civil::date(2026, 11, 9));
         // sunday-start begins Sunday 11-08
-        assert_eq!(week_key_sow(wed, &tz, 0), "2026-11-08");
+        assert_eq!(week_start(wed, 0), jiff::civil::date(2026, 11, 8));
+        let sun = jiff::civil::date(2026, 11, 8);
         // a sunday input belongs to that same sunday week
-        let sun = jiff::civil::date(2026, 11, 8)
-            .at(12, 0, 0, 0)
-            .to_zoned(tz.clone())
-            .unwrap()
-            .timestamp()
-            .as_millisecond();
-        assert_eq!(week_key_sow(sun, &tz, 0), "2026-11-08");
+        assert_eq!(week_start(sun, 0), sun);
         // but to the previous monday week (which ended saturday)
-        assert_eq!(week_key_sow(sun, &tz, 1), "2026-11-02");
+        assert_eq!(week_start(sun, 1), jiff::civil::date(2026, 11, 2));
     }
 
     #[test]
@@ -641,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn month_key_is_year_month() {
+    fn monthly_rows_bucket_by_year_month() {
         let tz = jiff::tz::TimeZone::UTC;
         let ms = jiff::civil::date(2026, 3, 15)
             .at(12, 0, 0, 0)
@@ -649,7 +755,11 @@ mod tests {
             .unwrap()
             .timestamp()
             .as_millisecond();
-        assert_eq!(month_key(ms, &tz), "2026-03");
+        let p = Pricing::default();
+        let ctx = Ctx::new(&p, CostMode::Auto, tz, false, false, 1);
+        let rows = Report::Monthly.rows(&[entry_at(ms)], &ctx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].period, "2026-03");
     }
 }
 
