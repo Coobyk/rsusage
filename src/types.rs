@@ -45,7 +45,7 @@ impl Tokens {
 ///
 /// Strings are `Arc<str>` so the entry cache can intern them — a model name
 /// shared by 100k entries costs one allocation, not 100k.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UsageEntry {
     /// agent id: "claude", "codex", "opencode", "devin", ...
     /// (`'static` str; the entry cache re-attaches it at read time.)
@@ -57,6 +57,8 @@ pub struct UsageEntry {
     pub session_id: std::sync::Arc<str>,
     /// model name as reported by the harness
     pub model: std::sync::Arc<str>,
+    /// provider id as reported by the harness ("" when the source has none)
+    pub provider: std::sync::Arc<str>,
     pub tokens: Tokens,
     /// cost reported by the harness itself, if any (display mode)
     pub cost_usd: Option<f64>,
@@ -67,6 +69,15 @@ pub struct UsageEntry {
     /// needs the key string itself
     #[serde(skip)]
     pub dedup_id: u64,
+    /// reported total when the source tracks one (codex `total_tokens`) —
+    /// sources where reasoning sits inside the counted buckets use this so
+    /// `totalTokens` is not inflated by counting reasoning a second time
+    #[serde(default)]
+    pub total_override: Option<u64>,
+    /// codex: the model was a runtime fallback, not the record's pick —
+    /// reported as `isFallback` in codex's `models` breakdown
+    #[serde(default)]
+    pub is_fallback: bool,
     /// working directory / project label, best effort
     pub project: std::sync::Arc<str>,
 }
@@ -75,6 +86,14 @@ pub struct UsageEntry {
 #[derive(Debug, Clone, Default)]
 pub struct ModelAgg {
     pub tokens: Tokens,
+    /// codex only: tokens from requests whose whole context exceeded the
+    /// model's long-context threshold — upstream prices the aggregated
+    /// bucket with per-request long-context bookkeeping
+    pub long: Tokens,
+    /// Σ per-day row costs when this aggregate was folded from daily rows —
+    /// upstream builds weekly/monthly over daily summaries, so a folded
+    /// model's cost is the day-by-day sum, not one flat aggregate
+    pub folded_cost: Option<f64>,
     /// harness-reported cost sum (display mode)
     pub display_cost: f64,
     /// sum of calculated costs (entries with a pricing hit)
@@ -83,18 +102,54 @@ pub struct ModelAgg {
     pub auto_cost: f64,
     /// number of entries with a reported cost
     pub cost_count: u64,
+    /// any unresolved-cost entry that stays missing in `auto` mode —
+    /// upstream marks `missingPricing` per record; a stored cost suppresses
+    /// the flag by each adapter's own rule
+    pub any_missing_auto: bool,
+    /// same for `calculate` mode — only kilo-style adapters (a stored cost
+    /// above zero) suppress the flag there
+    pub any_missing_calc: bool,
+    /// sum of per-entry `total_override` — reported totals the source counted
+    /// itself (codex); entries without one contribute `tokens.total()`
+    pub total_sum: u64,
+    /// Σ per-entry reported input — codex entries contribute non-cached
+    /// input (raw minus both cache buckets), others raw input
+    pub display_input: u64,
+    /// codex `isFallback` — any event whose model was a runtime fallback
+    pub is_fallback: bool,
 }
 
 /// Mutable accumulator for a group of entries (period, session, block...).
 #[derive(Debug, Clone, Default)]
 pub struct Acc {
     pub tokens: Tokens,
+    /// per-entry cost sums in entry order — upstream's `total_cost`
+    /// accumulates `entry.cost`, so a row's `totalCost` is this, not Σ models
+    pub cost_display: f64,
+    pub cost_calc: f64,
+    pub cost_auto: f64,
+    /// Σ per-entry reported totals (codex); others add `tokens.total()`
+    pub total_sum: u64,
+    /// Σ per-entry reported input (codex entries non-cached)
+    pub display_input: u64,
     /// model -> ModelAgg (unordered; consumers sort by name for output)
     pub models: FxHashMap<String, ModelAgg>,
     /// first-seen model order (ccusage keeps insertion order in modelsUsed)
     pub model_order: Vec<String>,
     /// agent -> per-agent aggregates (one level deep only)
     pub agents: BTreeMap<&'static str, AgentAcc>,
+    /// Σ per-day row costs when folded from daily rows (weekly/monthly)
+    pub folded_cost: Option<f64>,
+    /// breakdown insertion order after a daily fold — upstream folds each
+    /// day's cost-desc-sorted breakdown list at its first-seen position,
+    /// which differs from `modelsUsed`' first-seen order; empty on direct
+    /// accumulators (they share `model_order`)
+    pub breakdown_order: Vec<String>,
+    /// merged folds only: each agent's per-day slice costs in date order —
+    /// upstream's flat row list arrives agent-major, so a merged period's
+    /// total sums every day-slice cost in agent-major-then-date order and
+    /// can't be rebuilt from slice subtotals without changing the last ulp
+    pub day_costs: BTreeMap<&'static str, Vec<f64>>,
     pub project: String,
     pub last_activity_ms: i64,
     pub first_activity_ms: i64,
@@ -106,22 +161,90 @@ pub struct Acc {
 pub struct AgentAcc {
     pub tokens: Tokens,
     pub models: FxHashMap<String, ModelAgg>,
+    /// first-seen model order within the agent slice — merged model
+    /// breakdowns order each agent's rows by stable cost-desc over this
+    pub model_order: Vec<String>,
     pub entry_count: u64,
+    pub total_sum: u64,
+    /// Σ per-entry reported input (codex entries non-cached)
+    pub display_input: u64,
+    /// per-entry cost sums by mode — a merged row's slice cost is the
+    /// agent's own entry-order sum, not Σ per-model
+    pub cost_display: f64,
+    pub cost_calc: f64,
+    pub cost_auto: f64,
+    /// Σ per-day slice costs when folded from daily rows (weekly/monthly)
+    pub folded_cost: Option<f64>,
+    /// like `Acc::breakdown_order` — populated only by the daily fold
+    pub breakdown_order: Vec<String>,
+}
+
+impl Acc {
+    /// The order `modelBreakdowns` should iterate — the daily-fold
+    /// insertion order when folded, else first-seen order.
+    pub fn bd_order(&self) -> &[String] {
+        if self.breakdown_order.is_empty() {
+            &self.model_order
+        } else {
+            &self.breakdown_order
+        }
+    }
+}
+
+impl AgentAcc {
+    /// Slice-level `bd_order` — same folded-vs-first-seen rule.
+    pub fn bd_order(&self) -> &[String] {
+        if self.breakdown_order.is_empty() {
+            &self.model_order
+        } else {
+            &self.breakdown_order
+        }
+    }
 }
 
 impl Acc {
     pub fn add(&mut self, e: &UsageEntry, pricing: &crate::pricing::Pricing) {
-        self.add_costed(e, pricing.entry_cost(e), true);
+        self.add_costed(e, pricing.entry_cost(e), true, pricing);
     }
 
     /// `add` with the catalog cost already resolved (`pricing.entry_cost`)
     /// and agent slices optional — only merged reports read `agents`.
-    pub fn add_costed(&mut self, e: &UsageEntry, calc: Option<f64>, track_agents: bool) {
-        // a stored cost of 0 means "not computed" (harnesses write it for
-        // free-tier models) — auto mode must fall back to the catalog price
-        let stored = e.cost_usd.filter(|&c| c != 0.0);
+    pub fn add_costed(
+        &mut self,
+        e: &UsageEntry,
+        calc: Option<f64>,
+        track_agents: bool,
+        pricing: &crate::pricing::Pricing,
+    ) {
+        // stored-cost semantics per upstream adapters: opencode discards a
+        // stored 0 ("not computed" on free-tier records) and recalculates;
+        // codex has no stored cost upstream — its reports price every record,
+        // so all modes emit the calculated value; every other agent's Auto
+        // mode takes a stored cost verbatim
+        let stored = if e.agent == "opencode" {
+            e.cost_usd.filter(|&c| c > 0.0)
+        } else if e.agent == "codex" {
+            calc
+        } else {
+            e.cost_usd
+        };
         let auto = stored.or(calc).unwrap_or(0.0);
+        // upstream reports non-cached input for codex (`non_cached_input`),
+        // raw input for everyone else — tracked per entry so merged rows
+        // mix the semantics correctly
+        let display_input = if e.agent == "codex" {
+            e.tokens
+                .input
+                .saturating_sub(e.tokens.cache_read.saturating_add(e.tokens.cache_creation))
+        } else {
+            e.tokens.input
+        };
         self.tokens += e.tokens;
+        self.display_input += display_input;
+        self.cost_display += stored.unwrap_or(0.0);
+        self.cost_calc += calc.unwrap_or(0.0);
+        self.cost_auto += auto;
+        self.total_sum += e.total_override.unwrap_or_else(|| e.tokens.total());
         self.entry_count += 1;
         match self.models.get_mut(e.model.as_ref()) {
             Some(m) => add_costs(m, e, stored, calc, auto),
@@ -139,16 +262,44 @@ impl Acc {
         if track_agents {
             let a = self.agents.entry(e.agent).or_default();
             a.tokens += e.tokens;
+            a.display_input += display_input;
+            a.total_sum += e.total_override.unwrap_or_else(|| e.tokens.total());
             a.entry_count += 1;
-            match a.models.get_mut(e.model.as_ref()) {
-                Some(m) => add_costs(m, e, stored, calc, auto),
-                None => add_costs(
+            a.cost_display += stored.unwrap_or(0.0);
+            a.cost_calc += calc.unwrap_or(0.0);
+            a.cost_auto += auto;
+            if a.models.contains_key(e.model.as_ref()) {
+                add_costs(
+                    a.models.get_mut(e.model.as_ref()).unwrap(),
+                    e,
+                    stored,
+                    calc,
+                    auto,
+                );
+            } else {
+                a.model_order.push(e.model.to_string());
+                add_costs(
                     a.models.entry(e.model.to_string()).or_default(),
                     e,
                     stored,
                     calc,
                     auto,
-                ),
+                );
+            }
+        }
+        // codex bills whole requests: entries whose raw context crosses the
+        // model's tier boundary join the long bucket so report-level costs
+        // can price the aggregated buckets like upstream
+        if e.agent == "codex" && e.tokens.input > pricing.codex_threshold(&e.model) {
+            if let Some(m) = self.models.get_mut(e.model.as_ref()) {
+                m.long += e.tokens;
+            }
+            if let Some(m) = self
+                .agents
+                .get_mut(e.agent)
+                .and_then(|a| a.models.get_mut(e.model.as_ref()))
+            {
+                m.long += e.tokens;
             }
         }
         if self.project.is_empty() && !e.project.is_empty() {
@@ -163,12 +314,47 @@ impl Acc {
     }
 
     pub fn total(&self) -> u64 {
-        self.tokens.total()
+        self.total_sum
     }
 }
 
-fn add_costs(m: &mut ModelAgg, e: &UsageEntry, stored: Option<f64>, calc: Option<f64>, auto: f64) {
+/// Whether a positive stored cost suppresses `missingPricing` for this
+/// adapter: kilo/opencode/hermes treat any `cost_usd > 0` as priced in every
+/// non-display mode; the rest only let a stored cost answer in `auto`.
+fn stored_suppresses_missing(agent: &str, stored: Option<f64>) -> (bool, bool) {
+    let gt_zero = matches!(agent, "kilo" | "opencode" | "hermes");
+    (
+        if gt_zero {
+            stored.is_some_and(|c| c > 0.0)
+        } else {
+            stored.is_some()
+        },
+        gt_zero && stored.is_some_and(|c| c > 0.0),
+    )
+}
+
+fn add_costs(
+    m: &mut ModelAgg,
+    e: &UsageEntry,
+    stored: Option<f64>,
+    calc: Option<f64>,
+    auto: f64,
+) {
     m.tokens += e.tokens;
+    m.display_input += if e.agent == "codex" {
+        e.tokens
+            .input
+            .saturating_sub(e.tokens.cache_read.saturating_add(e.tokens.cache_creation))
+    } else {
+        e.tokens.input
+    };
+    m.total_sum += e.total_override.unwrap_or_else(|| e.tokens.total());
+    m.is_fallback |= e.is_fallback;
+    if calc.is_none() && e.tokens.total() > 0 {
+        let (auto, calc_m) = stored_suppresses_missing(e.agent, stored);
+        m.any_missing_auto |= !auto;
+        m.any_missing_calc |= !calc_m;
+    }
     if let Some(c) = stored {
         m.display_cost += c;
         m.cost_count += 1;
@@ -177,6 +363,16 @@ fn add_costs(m: &mut ModelAgg, e: &UsageEntry, stored: Option<f64>, calc: Option
         m.calc_cost += c;
     }
     m.auto_cost += auto;
+}
+
+/// Upstream `json_float`: integral costs serialize as JSON ints (`0`, not
+/// `0.0`). Only `costUSD`-style fields use it; `totalCost`/`cost` stay f64.
+pub(crate) fn json_float(v: f64) -> serde_json::Value {
+    if v.is_finite() && v.fract() == 0.0 && v >= i64::MIN as f64 && v <= i64::MAX as f64 {
+        serde_json::Value::from(v as i64)
+    } else {
+        serde_json::Value::from(v)
+    }
 }
 
 /// Serializable report row (daily/weekly/monthly/session).
@@ -206,7 +402,9 @@ pub struct Row {
     pub model_breakdowns: Vec<ModelRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Table-only data: upstream renders per-agent sub-rows in merged tables
+    /// but its default JSON schema carries no `agentBreakdowns` field.
+    #[serde(skip)]
     pub agent_breakdowns: Option<Vec<AgentRow>>,
 }
 
@@ -220,6 +418,7 @@ impl Row {
             cache_read_tokens: self.cache_read_tokens,
             total_tokens: self.total_tokens,
             total_cost: self.total_cost,
+            unpriced_models: Vec::new(),
         }
     }
 }
@@ -235,8 +434,12 @@ pub struct ModelRow {
     pub cost: f64,
     #[serde(skip)]
     pub reasoning_tokens: u64,
+    /// reported total (codex `models.<m>.totalTokens`); table rows don't read it
     #[serde(skip)]
-    pub stored_cost: Option<f64>,
+    pub total_tokens: u64,
+    /// codex `models.<m>.isFallback`
+    #[serde(skip)]
+    pub is_fallback: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub missing_pricing: bool,
 }
@@ -252,6 +455,9 @@ pub struct AgentRow {
     pub total_tokens: u64,
     pub total_cost: f64,
     pub models_used: Vec<String>,
+    /// Table-only: merged `--breakdown` renders each agent slice's models
+    /// under its sub-row
+    pub model_breakdowns: Vec<ModelRow>,
 }
 
 impl AgentRow {
@@ -264,6 +470,7 @@ impl AgentRow {
             cache_read_tokens: self.cache_read_tokens,
             total_tokens: self.total_tokens,
             total_cost: self.total_cost,
+            unpriced_models: Vec::new(),
         }
     }
 }
@@ -277,6 +484,10 @@ pub struct Totals {
     pub cache_read_tokens: u64,
     pub total_tokens: u64,
     pub total_cost: f64,
+    /// models flagged `missingPricing` anywhere in the report, sorted+deduped;
+    /// absent (not empty) when everything resolved
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unpriced_models: Vec<String>,
 }
 
 impl Totals {
@@ -346,10 +557,13 @@ mod tests {
             timestamp_ms: 1_000,
             session_id: "s".into(),
             model: "m".into(),
+            provider: "".into(),
             tokens,
             cost_usd: None,
             dedup_key: "".into(),
             dedup_id: 0,
+            total_override: None,
+            is_fallback: false,
             project: "".into(),
         }
     }

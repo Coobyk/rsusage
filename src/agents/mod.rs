@@ -188,7 +188,7 @@ const BESPOKE: &[Bespoke] = &[
         })
     }),
     Bespoke("kilo", "Kilo", false, || {
-        Box::new(sqlite::OpenCodeDb {
+        Box::new(sqlite::KiloDb {
             id: "kilo",
             display: "Kilo",
             path: paths::xdg_data().join("kilo/kilo.db"),
@@ -347,10 +347,13 @@ mod tests {
             timestamp_ms: 0,
             session_id: "s".into(),
             model: "m".into(),
+            provider: "".into(),
             tokens: Tokens::default(),
             cost_usd: None,
             dedup_key: key.into(),
             dedup_id: 0,
+                total_override: None,
+                is_fallback: false,
             project: "".into(),
         }
     }

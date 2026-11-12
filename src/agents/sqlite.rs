@@ -52,7 +52,7 @@ const CACHE_TAIL: i64 = 2000;
 
 /// Bump when the stored blob layout changes — old blobs are undecodable, so
 /// every cached entry, watermark and source signature is dropped.
-const CACHE_FORMAT: i64 = 6;
+const CACHE_FORMAT: i64 = 10;
 
 /// Chunk blob layout — hand-rolled, fixed-stride so decode is offset math
 /// and can fan out by byte range:
@@ -63,9 +63,13 @@ const CACHE_FORMAT: i64 = 6;
 /// decoding them — the common read path then needs no sort or merge.
 const CHUNK_MAGIC: u32 = 0x5253_5547; // "RSUG"
 const CHUNK_HDR: usize = 28;
-const REC_SIZE: usize = 88;
-// record: i64 rowid | i64 ts | u64 dedup_id | u32 s | u32 m | u32 p | u32 _ |
-//         u64 tok_in,out,rea,cc,cr | f64 cost (NaN = none)
+const REC_SIZE: usize = 104;
+// record: i64 rowid | i64 ts | u64 dedup_id | u32 s | u32 m | u32 p | u32 prov+1 |
+//         u64 tok_in,out,rea,cc,cr | f64 cost (NaN = none) |
+//         u64 total_override+1 | u64 flags (bit0 = is_fallback)
+// prov+1: string-table index of the provider id plus one; 0 = no provider, so
+// blobs written before providers existed decode as provider-less.
+// total_override+1 / flags: 0 = none — pre-v8 blobs decode as unflagged.
 
 /// Serialize `(rowid, entry)` rows into one interned chunk blob.
 fn encode_chunk(rows: &[(i64, UsageEntry)]) -> Option<Vec<u8>> {
@@ -98,13 +102,20 @@ fn encode_chunk(rows: &[(i64, UsageEntry)]) -> Option<Vec<u8>> {
             &intern(&e.session_id).to_le_bytes(),
             &intern(&e.model).to_le_bytes(),
             &intern(&e.project).to_le_bytes(),
-            &0u32.to_le_bytes(),
+            &(if e.provider.is_empty() {
+                0u32
+            } else {
+                intern(&e.provider) + 1
+            })
+            .to_le_bytes(),
             &e.tokens.input.to_le_bytes(),
             &e.tokens.output.to_le_bytes(),
             &e.tokens.reasoning.to_le_bytes(),
             &e.tokens.cache_creation.to_le_bytes(),
             &e.tokens.cache_read.to_le_bytes(),
             &e.cost_usd.unwrap_or(f64::NAN).to_le_bytes(),
+            &(e.total_override.map_or(0u64, |t| t + 1)).to_le_bytes(),
+            &(e.is_fallback as u64).to_le_bytes(),
         ] {
             recs.extend_from_slice(b);
         }
@@ -252,6 +263,7 @@ fn decode_chunk_entries(blob: &[u8], agent: &'static str) -> Option<Vec<UsageEnt
                         s0: idx(24)?,
                         s1: idx(28)?,
                         s2: idx(32)?,
+                        s3: u32_at(36),
                         tokens: [
                             u64_at(40),
                             u64_at(48),
@@ -260,6 +272,8 @@ fn decode_chunk_entries(blob: &[u8], agent: &'static str) -> Option<Vec<UsageEnt
                             u64_at(72),
                         ],
                         cost: c,
+                        total_override: u64_at(88),
+                        flags: u64_at(96),
                     })
                 })
                 .collect()
@@ -273,6 +287,11 @@ fn decode_chunk_entries(blob: &[u8], agent: &'static str) -> Option<Vec<UsageEnt
             timestamp_ms: c.ts,
             session_id: table[c.s0 as usize].clone(),
             model: table[c.s1 as usize].clone(),
+            provider: c
+                .s3
+                .checked_sub(1)
+                .and_then(|i| table.get(i as usize).cloned())
+                .unwrap_or_default(),
             tokens: Tokens {
                 input: c.tokens[0],
                 output: c.tokens[1],
@@ -283,6 +302,8 @@ fn decode_chunk_entries(blob: &[u8], agent: &'static str) -> Option<Vec<UsageEnt
             cost_usd: (!c.cost.is_nan()).then_some(c.cost),
             dedup_key: empty.clone(),
             dedup_id: c.dedup_id,
+            total_override: c.total_override.checked_sub(1),
+            is_fallback: c.flags & 1 != 0,
             project: table[c.s2 as usize].clone(),
         }));
     }
@@ -296,8 +317,11 @@ struct CRec {
     s0: u32,
     s1: u32,
     s2: u32,
+    s3: u32,
     tokens: [u64; 5],
     cost: f64,
+    total_override: u64,
+    flags: u64,
 }
 
 fn decode_records(blk: &[u8], table: &[std::sync::Arc<str>]) -> Option<Vec<(i64, UsageEntry)>> {
@@ -318,6 +342,14 @@ fn decode_records(blk: &[u8], table: &[std::sync::Arc<str>]) -> Option<Vec<(i64,
                     timestamp_ms: i64_at(r, 8),
                     session_id: get(24)?,
                     model: get(28)?,
+                    provider: {
+                        let v = u32_at(r, 36);
+                        if v == 0 {
+                            empty.clone()
+                        } else {
+                            table.get(v as usize - 1).cloned()?
+                        }
+                    },
                     tokens: Tokens {
                         input: u64_at(r, 40),
                         output: u64_at(r, 48),
@@ -328,6 +360,8 @@ fn decode_records(blk: &[u8], table: &[std::sync::Arc<str>]) -> Option<Vec<(i64,
                     cost_usd: (!c.is_nan()).then_some(c),
                     dedup_key: empty.clone(),
                     dedup_id: u64_at(r, 16),
+                    total_override: u64_at(r, 88).checked_sub(1),
+                    is_fallback: u64_at(r, 96) & 1 != 0,
                     project: get(32)?,
                 },
             ))
@@ -1203,9 +1237,12 @@ pub(super) fn sig_scan(
 // ---------------------------------------------------------------------------
 
 /// Which generation of the opencode message schema to read. `V2` stores usage
-/// on `session_message` rows joined to `session_v2` for the project dir;
-/// `V1` stores it on `message` rows for assistant roles only.
-#[derive(Clone, Copy)]
+/// on `session_message` rows; `V1` stores it on `message` rows. Upstream reads
+/// v1 first, then v2, then `storage/message/**/*.json` files, deduplicated by
+/// message id in that order; compaction-type rows never produce entries —
+/// their usage only surfaces through `session_v2`/`session` aggregates, which
+/// fill sessions that have no message entries at all.
+#[derive(Clone, Copy, PartialEq)]
 enum OcSchema {
     V1,
     V2,
@@ -1220,9 +1257,10 @@ impl OcSchema {
     }
 }
 
-/// OpenCode-family stores (`opencode.db`, `kilo.db`): messages carry token
-/// usage under `data.tokens` + model + cost. Upstream reads both schema
-/// generations, deduplicated by message id downstream.
+/// OpenCode's `~/.local/share/opencode/opencode.db`. Model and provider are
+/// both required for an entry: v2 reads `model.id`/`model.providerID` falling
+/// back to the top-level `modelID`/`providerID`; v1 and message files read the
+/// top-level fields only.
 pub struct OpenCodeDb {
     pub id: &'static str,
     pub display: &'static str,
@@ -1237,10 +1275,10 @@ impl AgentReader for OpenCodeDb {
         self.display
     }
     fn detect(&self) -> bool {
-        self.path.is_file()
+        self.path.is_file() || self.opencode_dir().join("storage/message").is_dir()
     }
     fn cache_key(&self) -> Option<String> {
-        src_sig(&self.path)
+        Some(format!("{}|{}", src_sig(&self.path).unwrap_or_default(), self.files_sig()))
     }
 
     fn entries(&self) -> Vec<UsageEntry> {
@@ -1249,11 +1287,30 @@ impl AgentReader for OpenCodeDb {
             || self.entries_table(OcSchema::V2),
         );
         v1.extend(v2);
+        v1.extend(self.entries_files(&v1));
+        v1.extend(self.entries_aggregates(&v1));
         v1
     }
 }
 
 impl OpenCodeDb {
+    fn opencode_dir(&self) -> &Path {
+        self.path.parent().unwrap_or(self.path.as_path())
+    }
+
+    /// Manifest over `storage/message/**/*.json` for cache invalidation —
+    /// count + (mtime, len) of each file, no contents.
+    fn files_sig(&self) -> String {
+        let mut files = Vec::new();
+        super::walk(
+            &self.opencode_dir().join("storage/message"),
+            &|p| p.extension().is_some_and(|e| e == "json"),
+            &mut files,
+            8,
+        );
+        file_sig(&files).unwrap_or_default()
+    }
+
     fn entries_table(&self, schema: OcSchema) -> Vec<UsageEntry> {
         let cache_name = match schema {
             OcSchema::V1 => self.id.to_string(),
@@ -1282,32 +1339,47 @@ impl OpenCodeDb {
         let Some(conn) = open_db(path) else {
             return vec![];
         };
+        // One extraction order for both generations; the decoder coalesces the
+        // model/provider spellings per generation.
+        let json = |d: &str| {
+            format!(
+                "json_extract({d}, \
+                 '$.tokens.input', '$.tokens.output', '$.tokens.reasoning', \
+                 '$.tokens.cache.read', '$.tokens.cache.write', '$.tokens.total', \
+                 '$.model.id', '$.model.modelID', '$.modelID', \
+                 '$.model.providerID', '$.providerID', \
+                 '$.time.created', '$.cost')"
+            )
+        };
         let sql = match schema {
-            // the trailing NULL column keeps v1/v2 on one row-decoding path
-            OcSchema::V2 => {
-                "SELECT m.rowid, m.id, m.session_id, m.time_created, \
-                        json_extract(m.data, \
-                            '$.tokens.input', '$.tokens.output', '$.tokens.reasoning', \
-                            '$.tokens.cache.read', '$.tokens.cache.write', \
-                            '$.model.id', '$.time.created', '$.cost'), \
-                        s.directory \
+            // upstream counts assistant rows only — compaction usage is
+            // reported through the session aggregates instead
+            OcSchema::V2 => format!(
+                "SELECT m.rowid, m.id, m.session_id, m.time_created, {} \
                  FROM session_message m \
-                 LEFT JOIN session_v2 s ON s.id = m.session_id \
                  WHERE m.rowid >= ?1 AND m.rowid <= ?2 \
-                   AND json_extract(m.data, '$.tokens.input') IS NOT NULL"
-            }
-            OcSchema::V1 => {
-                "SELECT rowid, id, session_id, time_created, json_extract(data, \
-                    '$.tokens.input', '$.tokens.output', '$.tokens.reasoning', \
-                    '$.tokens.cache.read', '$.tokens.cache.write', \
-                    '$.modelID', '$.time.created', '$.cost'), \
-                    NULL \
+                   AND m.type = 'assistant' \
+                   AND json_extract(m.data, '$.tokens') IS NOT NULL \
+                   AND COALESCE(json_extract(m.data,'$.model.id'), \
+                                json_extract(m.data,'$.model.modelID'), \
+                                json_extract(m.data,'$.modelID')) IS NOT NULL \
+                   AND COALESCE(json_extract(m.data,'$.model.providerID'), \
+                                json_extract(m.data,'$.providerID')) IS NOT NULL",
+                json("m.data")
+            ),
+            OcSchema::V1 => format!(
+                "SELECT rowid, id, session_id, time_created, {} \
                  FROM message \
                  WHERE rowid >= ?1 AND rowid <= ?2 \
-                   AND json_extract(data, '$.role') = 'assistant'"
-            }
+                   AND json_extract(data, '$.tokens') IS NOT NULL \
+                   AND json_extract(data, '$.modelID') IS NOT NULL \
+                   AND json_extract(data, '$.modelID') != '' \
+                   AND json_extract(data, '$.providerID') IS NOT NULL \
+                   AND json_extract(data, '$.providerID') != ''",
+                json("data")
+            ),
         };
-        let mut stmt = match conn.prepare(sql) {
+        let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
@@ -1317,41 +1389,404 @@ impl OpenCodeDb {
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<i64>>(3)?,
                     r.get::<_, String>(4)?,
-                    r.get::<_, Option<String>>(5)?,
                 ))
             })
             .map(|r| r.flatten().collect::<Vec<_>>())
             .unwrap_or_default();
         let mut out = Vec::with_capacity(rows.len());
-        for (rowid, id, session, created, arr, directory) in rows {
+        for (rowid, id, session, created, arr) in rows {
             let Ok(d) = serde_json::from_str::<serde_json::Value>(&arr) else {
                 continue;
             };
-            let tokens = Tokens {
+            let (model, provider) = match schema {
+                OcSchema::V2 => (
+                    d[6].as_str()
+                        .or_else(|| d[7].as_str())
+                        .or_else(|| d[8].as_str()),
+                    d[9].as_str().or_else(|| d[10].as_str()),
+                ),
+                OcSchema::V1 => (d[8].as_str(), d[10].as_str()),
+            };
+            let (Some(model), Some(provider)) = (model, provider) else {
+                continue;
+            };
+            if model.is_empty() || provider.is_empty() {
+                continue;
+            }
+            let mut tokens = Tokens {
                 input: d[0].as_u64().unwrap_or(0),
                 output: d[1].as_u64().unwrap_or(0),
                 reasoning: d[2].as_u64().unwrap_or(0),
                 cache_creation: d[4].as_u64().unwrap_or(0),
                 cache_read: d[3].as_u64().unwrap_or(0),
             };
+            fold_total_into_extra(&mut tokens, d[5].as_u64().unwrap_or(0));
             if tokens.is_zero() {
                 continue;
             }
-            let ts = d[6].as_i64().unwrap_or(created);
+            // v2 falls back to the row's time_created only when the payload
+            // lacks time.created; v1 has no column fallback. A nonpositive
+            // created means epoch, matching upstream's >0 filter.
+            let ts = match schema {
+                OcSchema::V2 => d[11].as_i64().or(created).unwrap_or(0).max(0),
+                OcSchema::V1 => d[11].as_i64().unwrap_or(0).max(0),
+            };
             out.push((
                 rowid,
                 UsageEntry {
                     agent,
-                    timestamp_ms: epoch_to_ms(ts),
+                    timestamp_ms: ts,
                     session_id: session.into(),
-                    model: d[5].as_str().unwrap_or(UNKNOWN_MODEL).into(),
+                    model: model.into(),
+                    provider: provider.into(),
                     tokens,
-                    cost_usd: d[7].as_f64(),
+                    cost_usd: d[12].as_f64(),
                     dedup_key: id.into(),
                     dedup_id: 0,
-                    project: directory.unwrap_or_default().into(),
+                total_override: None,
+                is_fallback: false,
+                    project: agent.into(),
+                },
+            ));
+        }
+        out
+    }
+
+    /// Legacy `storage/message/<session>/<id>.json` files. Upstream skips a
+    /// file whose stem is already a known message id; survivors dedup on the
+    /// payload's `id` downstream like every other entry.
+    fn entries_files(&self, prior: &[UsageEntry]) -> Vec<UsageEntry> {
+        let dir = self.opencode_dir().join("storage/message");
+        if !dir.is_dir() {
+            return vec![];
+        }
+        let seen: rustc_hash::FxHashSet<&str> =
+            prior.iter().map(|e| e.dedup_key.as_ref()).collect();
+        let mut files = Vec::new();
+        super::walk(
+            &dir,
+            &|p| p.extension().is_some_and(|e| e == "json"),
+            &mut files,
+            8,
+        );
+        files.retain(|f| {
+            f.file_stem()
+                .and_then(|s| s.to_str())
+                .is_none_or(|s| !seen.contains(s))
+        });
+        let id = self.id;
+        files
+            .par_iter()
+            .filter_map(|f| Self::read_message_file(f, id))
+            .collect()
+    }
+
+    fn read_message_file(path: &Path, agent: &'static str) -> Option<UsageEntry> {
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let t = v.get("tokens")?;
+        let model = v.get("modelID").and_then(|m| m.as_str())?;
+        let provider = v.get("providerID").and_then(|m| m.as_str())?;
+        if model.is_empty() || provider.is_empty() {
+            return None;
+        }
+        let mut tokens = Tokens {
+            input: num(t, "input"),
+            output: num(t, "output"),
+            reasoning: num(t, "reasoning"),
+            cache_creation: t
+                .get("cache")
+                .and_then(|c| c.get("write"))
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0),
+            cache_read: t
+                .get("cache")
+                .and_then(|c| c.get("read"))
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0),
+        };
+        fold_total_into_extra(
+            &mut tokens,
+            t.get("total").and_then(|x| x.as_u64()).unwrap_or(0),
+        );
+        if tokens.is_zero() {
+            return None;
+        }
+        Some(UsageEntry {
+            agent,
+            timestamp_ms: v
+                .get("time")
+                .and_then(|t| t.get("created"))
+                .and_then(|c| c.as_i64())
+                .unwrap_or(0)
+                .max(0),
+            session_id: v
+                .get("sessionID")
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown")
+                .into(),
+            model: model.into(),
+            provider: provider.into(),
+            tokens,
+            cost_usd: v.get("cost").and_then(|c| c.as_f64()),
+            dedup_key: v.get("id").and_then(|s| s.as_str()).unwrap_or("").into(),
+            dedup_id: 0,
+                total_override: None,
+                is_fallback: false,
+            project: agent.into(),
+        })
+    }
+
+    /// `session_v2`/`session` counters for sessions that produced no message
+    /// entries — the only place compaction usage surfaces. Entries carry the
+    /// upstream `session:<id>` key so reports can scope them to session rows.
+    fn entries_aggregates(&self, prior: &[UsageEntry]) -> Vec<UsageEntry> {
+        let covered: rustc_hash::FxHashSet<&str> =
+            prior.iter().map(|e| e.session_id.as_ref()).collect();
+        let Some(conn) = open_db(&self.path) else {
+            return vec![];
+        };
+        let has_v2_msgs = table_exists(&conn, "session_message");
+        let mut out = Vec::new();
+        for table in ["session_v2", "session"] {
+            if table == "session" && !has_v2_msgs {
+                continue;
+            }
+            if !table_exists(&conn, table) {
+                continue;
+            }
+            let sql = format!(
+                "SELECT id, time_created, cost, tokens_input, tokens_output, \
+                        tokens_cache_read, tokens_cache_write, \
+                        COALESCE(tokens_reasoning, 0), model FROM {table}"
+            );
+            let mut stmt = match conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<f64>>(1)?,
+                        r.get::<_, Option<f64>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
+                        r.get::<_, Option<i64>>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
+                        r.get::<_, Option<String>>(8)?,
+                    ))
+                })
+                .map(|r| r.flatten().collect::<Vec<_>>())
+                .unwrap_or_default();
+            for (sid, created, cost, i, o, cr, cw, re, model_raw) in rows {
+                if covered.contains(sid.as_str()) {
+                    continue;
+                }
+                let Some(created) = created.filter(|c| c.is_finite()) else {
+                    continue;
+                };
+                let (model, provider) = parse_session_model(model_raw.as_deref());
+                let tokens = Tokens {
+                    input: i.unwrap_or(0).max(0) as u64,
+                    output: o.unwrap_or(0).max(0) as u64,
+                    reasoning: re.unwrap_or(0).max(0) as u64,
+                    cache_creation: cw.unwrap_or(0).max(0) as u64,
+                    cache_read: cr.unwrap_or(0).max(0) as u64,
+                };
+                if tokens.is_zero() && cost.unwrap_or(0.0) <= 0.0 {
+                    continue;
+                }
+                out.push(UsageEntry {
+                    agent: self.id,
+                    timestamp_ms: created.max(0.0) as i64,
+                    session_id: sid.clone().into(),
+                    model: model.into(),
+                    provider: provider.into(),
+                    tokens,
+                    cost_usd: cost,
+                    dedup_key: format!("session:{sid}").into(),
+                    dedup_id: 0,
+                    total_override: None,
+                    is_fallback: false,
+                    project: self.id.into(),
+                });
+            }
+        }
+        out
+    }
+}
+
+/// `session.model` is either a JSON object (`{"id":..,"providerID":..}`), a
+/// bare string, or absent — upstream's `parse_session_model`.
+fn parse_session_model(value: Option<&str>) -> (String, String) {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return ("unknown".into(), "unknown".into());
+    };
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(value) {
+        if let Some(m) = v.as_str().map(str::trim).filter(|m| !m.is_empty()) {
+            return (m.to_string(), "unknown".into());
+        }
+        if let Some(o) = v.as_object() {
+            let model = o
+                .get("id")
+                .and_then(|x| x.as_str())
+                .or_else(|| o.get("modelID").and_then(|x| x.as_str()))
+                .map(str::trim)
+                .filter(|m| !m.is_empty());
+            let provider = o
+                .get("providerID")
+                .and_then(|x| x.as_str())
+                .or_else(|| o.get("provider").and_then(|x| x.as_str()))
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .unwrap_or("unknown");
+            if let Some(model) = model {
+                return (model.to_string(), provider.to_string());
+            }
+        }
+        return ("unknown".into(), "unknown".into());
+    }
+    (value.to_string(), "unknown".into())
+}
+
+/// Upstream `apply_total_token_fallback`: `reasoning` is the recorded extra;
+/// a `total` claiming more than every bucket adds the gap to output when
+/// output is empty, else to the extra (reasoning) bucket.
+fn fold_total_into_extra(tokens: &mut Tokens, total: u64) {
+    let missing = total.saturating_sub(tokens.total());
+    if missing == 0 {
+        return;
+    }
+    if tokens.output == 0 {
+        tokens.output = missing;
+    } else {
+        tokens.reasoning += missing;
+    }
+}
+
+fn table_exists(conn: &rusqlite::Connection, table: &str) -> bool {
+    conn.prepare(&format!("SELECT 1 FROM {table} LIMIT 0")).is_ok()
+}
+
+/// Kilo (`kilo.db`): an opencode fork that keeps the v1 `message` schema.
+/// Upstream reads only `message`, requires tokens + `modelID` + a usable
+/// `time.created` (seconds are normalized to ms), and treats `providerID`,
+/// `id`, and `sessionID` as optional.
+pub struct KiloDb {
+    pub id: &'static str,
+    pub display: &'static str,
+    pub path: PathBuf,
+}
+
+impl AgentReader for KiloDb {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn display(&self) -> &'static str {
+        self.display
+    }
+    fn detect(&self) -> bool {
+        self.path.is_file()
+    }
+    fn cache_key(&self) -> Option<String> {
+        src_sig(&self.path)
+    }
+    fn entries(&self) -> Vec<UsageEntry> {
+        let path = self.path.clone();
+        let id = self.id;
+        cached_scan(
+            &self.path,
+            "rowid",
+            "message",
+            self.id,
+            id,
+            &move |lo, hi| Self::scan_range(&path, id, lo, hi),
+            None,
+        )
+    }
+}
+
+impl KiloDb {
+    fn scan_range(path: &Path, agent: &'static str, lo: i64, hi: i64) -> Vec<(i64, UsageEntry)> {
+        let Some(conn) = open_db(path) else {
+            return vec![];
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT rowid, id, session_id, json_extract(data, \
+                '$.tokens.input', '$.tokens.output', '$.tokens.reasoning', \
+                '$.tokens.cache.read', '$.tokens.cache.write', '$.tokens.total', \
+                '$.modelID', '$.providerID', '$.time.created', '$.cost', \
+                '$.id', '$.sessionID') \
+             FROM message \
+             WHERE rowid >= ?1 AND rowid <= ?2 \
+               AND json_extract(data, '$.tokens') IS NOT NULL \
+               AND json_extract(data, '$.modelID') IS NOT NULL \
+               AND json_extract(data, '$.modelID') != ''",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt
+            .query_map([lo, hi], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map(|r| r.flatten().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut out = Vec::with_capacity(rows.len());
+        for (rowid, id, session, arr) in rows {
+            let Ok(d) = serde_json::from_str::<serde_json::Value>(&arr) else {
+                continue;
+            };
+            let Some(model) = d[6].as_str().filter(|m| !m.is_empty()) else {
+                continue;
+            };
+            // upstream requires a payload timestamp and normalizes seconds
+            let Some(created) = d[8].as_i64().filter(|c| *c > 0) else {
+                continue;
+            };
+            let ts = if created < 1_000_000_000_000 {
+                created.saturating_mul(1000)
+            } else {
+                created
+            };
+            let mut tokens = Tokens {
+                input: d[0].as_u64().unwrap_or(0),
+                output: d[1].as_u64().unwrap_or(0),
+                reasoning: d[2].as_u64().unwrap_or(0),
+                cache_creation: d[4].as_u64().unwrap_or(0),
+                cache_read: d[3].as_u64().unwrap_or(0),
+            };
+            fold_total_into_extra(&mut tokens, d[5].as_u64().unwrap_or(0));
+            if tokens.is_zero() {
+                continue;
+            }
+            out.push((
+                rowid,
+                UsageEntry {
+                    agent,
+                    timestamp_ms: ts,
+                    session_id: d[11].as_str().unwrap_or(session.as_str()).into(),
+                    model: model.into(),
+                    provider: d[7].as_str().unwrap_or("").into(),
+                    tokens,
+                    cost_usd: d[9].as_f64(),
+                    dedup_key: d[10]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{}:{id}", path.display()))
+                        .into(),
+                    dedup_id: 0,
+                    total_override: None,
+                    is_fallback: false,
+                    project: agent.into(),
                 },
             ));
         }
@@ -1525,6 +1960,7 @@ impl Devin {
                     timestamp_ms: ts,
                     session_id: session.into(),
                     model: model.unwrap_or_else(|| UNKNOWN_MODEL.into()).into(),
+                    provider: "".into(),
                     tokens,
                     cost_usd: cost,
                     dedup_key: d[1]
@@ -1533,6 +1969,8 @@ impl Devin {
                         .unwrap_or_else(|| row_id.to_string())
                         .into(),
                     dedup_id: 0,
+                total_override: None,
+                is_fallback: false,
                     project: cwd.unwrap_or_default().into(),
                 },
             ));
@@ -1576,13 +2014,14 @@ impl ZCode {
         let Some(conn) = open_db(&zcode_db()) else {
             return vec![];
         };
+        // upstream: completed rows only, joined to session for the project dir
         let mut stmt = match conn.prepare(
-            "SELECT id, session_id, started_at, model_id, provider_id, \
-                    input_tokens, output_tokens, reasoning_tokens, \
-                    cache_creation_input_tokens, cache_read_input_tokens \
-             FROM model_usage \
-             WHERE input_tokens > 0 OR output_tokens > 0 \
-                OR cache_read_input_tokens > 0 OR cache_creation_input_tokens > 0",
+            "SELECT m.id, m.session_id, m.started_at, m.model_id, m.provider_id, \
+                    m.input_tokens, m.output_tokens, \
+                    m.cache_creation_input_tokens, m.cache_read_input_tokens, \
+                    m.computed_total_tokens, s.directory \
+             FROM model_usage m LEFT JOIN session s ON s.id = m.session_id \
+             WHERE m.status = 'completed'",
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
@@ -1594,41 +2033,65 @@ impl ZCode {
                     r.get::<_, String>(1)?,
                     r.get::<_, i64>(2)?,
                     r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(4)?,
                     r.get::<_, i64>(5)?,
                     r.get::<_, i64>(6)?,
                     r.get::<_, i64>(7)?,
                     r.get::<_, i64>(8)?,
                     r.get::<_, i64>(9)?,
+                    r.get::<_, Option<String>>(10)?,
                 ))
             })
             .map(|r| r.flatten().collect::<Vec<_>>())
             .unwrap_or_default();
         rows.into_iter()
+            .filter(|(id, session, started, model, ..)| {
+                !id.is_empty() && !session.is_empty() && *started > 0 && !model.is_empty()
+            })
             .map(
-                |(id, session, started, model, provider, i, o, r_, cc, cr)| UsageEntry {
-                    agent: "zcode",
-                    timestamp_ms: epoch_to_ms(started),
-                    session_id: session.into(),
-                    model: if model.is_empty() {
-                        provider.into()
-                    } else {
-                        model.into()
-                    },
-                    // zcode input_tokens include cache reads; upstream subtracts
-                    tokens: Tokens {
-                        input: (i - cr).max(0) as u64,
-                        output: o.max(0) as u64,
-                        reasoning: r_.max(0) as u64,
-                        cache_creation: cc.max(0) as u64,
-                        cache_read: cr.max(0) as u64,
-                    },
-                    cost_usd: None,
-                    dedup_key: id.into(),
-                    dedup_id: 0,
-                    project: "".into(),
+                |(id, session, started, model, provider, i, o, cc, cr, total, directory)| {
+                    // zcode input_tokens include cache reads + writes; upstream
+                    // caps each at what input actually contains
+                    let cr = cr.clamp(0, i);
+                    let cc = cc.clamp(0, i - cr);
+                    let input = (i - cr - cc).max(0) as u64;
+                    let mut output = o.max(0) as u64;
+                    // extra total: tokens the record's computed total accounts
+                    // for beyond the reported buckets (upstream folds a gap
+                    // into output when output is 0, else counts it as extra)
+                    let mut extra = 0u64;
+                    let missing = (total.max(0) as u64)
+                        .saturating_sub(input + output + cc.max(0) as u64 + cr.max(0) as u64);
+                    if missing > 0 {
+                        if output == 0 {
+                            output = missing;
+                        } else {
+                            extra = missing;
+                        }
+                    }
+                    UsageEntry {
+                        agent: "zcode",
+                        timestamp_ms: started,
+                        session_id: session.into(),
+                        model: model.into(),
+                        provider: provider.unwrap_or_default().into(),
+                        tokens: Tokens {
+                            input,
+                            output,
+                            reasoning: extra,
+                            cache_creation: cc.max(0) as u64,
+                            cache_read: cr.max(0) as u64,
+                        },
+                        cost_usd: None,
+                        dedup_key: id.into(),
+                        dedup_id: 0,
+                        total_override: None,
+                        is_fallback: false,
+                        project: directory.unwrap_or_default().into(),
+                    }
                 },
             )
+            .filter(|e| e.tokens.total() > 0)
             .collect()
     }
 }
@@ -1732,10 +2195,13 @@ fn collect_usage_recursive(
                             .and_then(|m| m.as_str())
                             .unwrap_or(UNKNOWN_MODEL)
                             .into(),
+                        provider: "".into(),
                         tokens,
                         cost_usd: None,
                         dedup_key: format!("{session}:{}", out.len()).into(),
                         dedup_id: 0,
+                        total_override: None,
+                        is_fallback: false,
                         project: "".into(),
                     });
                 }
@@ -1868,10 +2334,13 @@ impl Cursor {
                     timestamp_ms: ts,
                     session_id: gstr(csess).into(),
                     model: gstr(cmodel).into(),
+                    provider: "".into(),
                     tokens,
                     cost_usd: None,
                     dedup_key: gstr(cid).into(),
                     dedup_id: 0,
+                total_override: None,
+                is_fallback: false,
                     project: "".into(),
                 });
             }
@@ -1890,10 +2359,13 @@ mod tests {
             timestamp_ms: 0,
             session_id: "s".into(),
             model: "m".into(),
+            provider: "".into(),
             tokens: Tokens::default(),
             cost_usd: None,
             dedup_key: tag.into(),
             dedup_id: 0,
+                total_override: None,
+                is_fallback: false,
             project: "".into(),
         }
     }

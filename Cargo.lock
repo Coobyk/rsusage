@@ -779,6 +779,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "terminal_size",
  "unicode-width 0.2.0",
  "ureq",
 ]
