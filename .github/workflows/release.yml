@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: echo "version=0.1.r$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="rsusage"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then bin="rsusage.exe"; fi
+          mkdir -p dist
+          tar -czf "dist/rsusage-${{ matrix.name }}.tar.gz" -C "target/${{ matrix.target }}/release" "$bin"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/rsusage-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - run: (cd dist && sha256sum *.tar.gz > SHA256SUMS.txt)
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: rsusage v${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          files: dist/*
+
+  aur:
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    env:
+      AUR_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+    steps:
+      - name: Check AUR secret
+        run: |
+          if [ -z "$AUR_PRIVATE_KEY" ]; then
+            echo "::notice::AUR_SSH_PRIVATE_KEY secret is not set — skipping AUR publish"
+            exit 0
+          fi
+      - uses: actions/checkout@v4
+        if: env.AUR_PRIVATE_KEY != ''
+      - name: Fetch release asset checksum
+        if: env.AUR_PRIVATE_KEY != ''
+        run: |
+          ver="${{ needs.version.outputs.version }}"
+          url="https://github.com/Coobyk/rsusage/releases/download/v${ver}/rsusage-linux-x86_64.tar.gz"
+          curl -fsSL -o asset.tar.gz "$url"
+          echo "sum=$(sha256sum asset.tar.gz | cut -d' ' -f1)" >> "$GITHUB_ENV"
+      - name: Render PKGBUILD and .SRCINFO
+        if: env.AUR_PRIVATE_KEY != ''
+        run: |
+          set -euo pipefail
+          ver="${{ needs.version.outputs.version }}"
+          sed -e "s/^pkgver=.*/pkgver=${ver}/" \
+              -e "s/^sha256sums=.*/sha256sums=('${sum}')/" \
+              packaging/aur/PKGBUILD > PKGBUILD
+          {
+            echo "pkgbase = rsusage-bin"
+            printf '\tpkgdesc = %s\n' "Blazing fast usage reports for coding agents - a Rust rewrite of ccusage (binary release)"
+            printf '\tpkgver = %s\n' "$ver"
+            printf '\tpkgrel = 1\n'
+            printf '\turl = %s\n' "https://github.com/Coobyk/rsusage"
+            printf '\tarch = x86_64\n'
+            printf '\tlicense = MIT\n'
+            printf '\tprovides = rsusage\n'
+            printf '\tconflicts = rsusage\n'
+            printf '\tsource = %s\n' "https://github.com/Coobyk/rsusage/releases/download/v${ver}/rsusage-linux-x86_64.tar.gz"
+            printf '\tsha256sums = %s\n' "$sum"
+            echo "pkgname = rsusage-bin"
+          } > .SRCINFO
+      - name: Publish to AUR
+        if: env.AUR_PRIVATE_KEY != ''
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git clone ssh://aur@aur.archlinux.org/rsusage-bin.git aur 2>/dev/null; then
+            :
+          else
+            mkdir aur && git -C aur init -b master
+          fi
+          cp PKGBUILD .SRCINFO aur/
+          cd aur
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "AUR package already up to date"
+            exit 0
+          fi
+          git commit -m "rsusage ${{ needs.version.outputs.version }}"
+          # first push creates the package; subsequent pushes update it
+          git push ssh://aur@aur.archlinux.org/rsusage-bin.git HEAD:master
