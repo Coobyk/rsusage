@@ -125,14 +125,16 @@ fn tz_of(name: &Option<String>) -> jiff::tz::TimeZone {
     }
 }
 
-fn readers_for(agent_id: Option<&'static str>) -> Vec<Box<dyn AgentReader>> {
+fn readers_for(agent_id: Option<&'static str>, all: bool) -> Vec<Box<dyn AgentReader>> {
     match agent_id {
         Some(id) => agents::by_id(id).into_iter().collect(),
         // merged reports cover exactly upstream's agent set — devin/zed/cursor
-        // are rsusage extensions and stay reachable via `rsusage <agent>`
+        // are rsusage extensions, reachable via `rsusage <agent>` or `--all`
         None => agents::all_agents()
             .into_iter()
-            .filter(|a| a.detect() && !matches!(a.id(), "devin" | "zed" | "cursor"))
+            .filter(|a| {
+                a.detect() && (all || !matches!(a.id(), "devin" | "zed" | "cursor"))
+            })
             .collect(),
     }
 }
@@ -410,7 +412,7 @@ pub fn run_report(
     }
     // --no-cost only hides the cost — pricing and sorting still apply
     let offline = f.offline;
-    let readers = readers_for(agent_id);
+    let readers = readers_for(agent_id, f.all);
     if readers.is_empty() {
         println!("No usage data found.");
         return Ok(());
@@ -450,7 +452,7 @@ fn run_session_detail(
     let f = &args.filter;
     let agent = agent_id.unwrap_or("claude");
     let wants_json = f.json || f.jq.is_some();
-    let readers = readers_for(Some(agent));
+    let readers = readers_for(Some(agent), false);
     let tz = tz_of(&f.timezone);
     let pricing = timed("pricing_load", || Pricing::load(f.offline));
     let (entries, detected) = prepare(&readers, f, &tz);
@@ -926,8 +928,9 @@ fn blocks_title(agent_id: Option<&'static str>, live: bool) -> &'static str {
 
 pub fn run_blocks(b: &BlocksArgs, _agent_id: Option<&'static str>) -> anyhow::Result<()> {
     // upstream `blocks` is the Claude report — even bare, non-claude readers
-    // never feed it (non-claude `<agent> blocks` was rejected upstream)
-    let agent_id = Some("claude");
+    // never feed it (non-claude `<agent> blocks` was rejected upstream).
+    // `--all` is an rsusage extension that widens it to every detected agent.
+    let agent_id = if b.filter.all { None } else { Some("claude") };
     let f = &b.filter;
     if b.session_length <= 0.0 {
         anyhow::bail!("Session length must be a positive number");
@@ -935,7 +938,7 @@ pub fn run_blocks(b: &BlocksArgs, _agent_id: Option<&'static str>) -> anyhow::Re
     let offline = f.offline;
     let pricing_handle = std::thread::spawn(move || Pricing::load(offline));
     if b.live {
-        let readers = readers_for(agent_id);
+        let readers = readers_for(agent_id, b.filter.all);
         if readers.is_empty() {
             println!("No usage data found.");
             return Ok(());
@@ -946,7 +949,7 @@ pub fn run_blocks(b: &BlocksArgs, _agent_id: Option<&'static str>) -> anyhow::Re
         let title = blocks_title(agent_id, true);
         return live::run(&readers, &ctx, b, title);
     }
-    let readers = readers_for(agent_id);
+    let readers = readers_for(agent_id, b.filter.all);
     if readers.is_empty() {
         println!("No usage data found.");
         return Ok(());
@@ -972,10 +975,12 @@ pub fn run_blocks(b: &BlocksArgs, _agent_id: Option<&'static str>) -> anyhow::Re
             if b.active {
                 return vec![("No active session block found.\n".to_string(), String::new())];
             }
-            return vec![(
-                String::new(),
-                "No Claude usage data found.\n".to_string(),
-            )];
+            let msg = if agent_id.is_some() {
+                "No Claude usage data found.\n"
+            } else {
+                "No usage data found.\n"
+            };
+            return vec![(String::new(), msg.to_string())];
         }
         let ctx = ctx_for(&pricing, f, tz.clone(), agent_id, None);
         let rows = block_rows(&entries, b, &ctx, now);
@@ -1032,7 +1037,7 @@ pub fn run_statusline(s: &StatusArgs, _agent_id: Option<&'static str>) -> anyhow
     let agent_id = Some("claude");
     let offline = s.offline && !s.no_offline;
     let pricing_handle = std::thread::spawn(move || Pricing::load(offline));
-    let readers = readers_for(agent_id);
+    let readers = readers_for(agent_id, false);
     let pricing = pricing_handle.join().unwrap();
     statusline::run(&readers, &pricing, &tz_of(&s.timezone), s)
 }

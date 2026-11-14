@@ -20,7 +20,7 @@ rsusage daily --json    # JSON output (ccusage-compatible schema)
 rsusage weekly          # merged weekly
 rsusage monthly         # merged monthly
 rsusage session         # per-session report
-rsusage blocks          # 5-hour billing blocks (all agents, not just Claude)
+rsusage blocks          # 5-hour billing blocks (--all: all agents, not just Claude)
 rsusage blocks --live   # live-updating block view (ratatui)
 rsusage statusline      # compact status line for Claude Code hooks
 ```
@@ -36,7 +36,8 @@ rsusage cursor daily    rsusage zed daily
 
 Common flags: `--json`, `--since/--until`, `--timezone`, `--mode
 auto|calculate|display`, `--breakdown`, `--offline`, `--no-cost`, `--compact`,
-`--last N`, `--sections daily,weekly,...`, `--by-agent`,
+`--last N`, `--sections daily,weekly,...`, `--by-agent`, `--all`
+(adds the extension agents — devin, zed, cursor — to merged reports and blocks),
 `-w/--start-of-week sunday|monday|...`, blocks: `--active`, `--recent`,
 `--token-limit <n|max>`, `--session-length <h>`.
 

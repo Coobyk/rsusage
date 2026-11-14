@@ -119,7 +119,7 @@ pub struct FilterArgs {
     /// Negatable of --offline
     #[arg(long, overrides_with = "offline")]
     pub no_offline: bool,
-    /// Accepted for compatibility; all detected agents included by default
+    /// Include every detected agent (adds rsusage extensions: devin, zed, cursor)
     #[arg(long)]
     pub all: bool,
     /// Include per-agent JSON breakdowns in unified report rows
