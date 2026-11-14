@@ -57,13 +57,18 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       # bake the release version into the binary so --version agrees with
-      # the tag; lock keeps the root package's own version, so stamp both
+      # the tag; lock keeps the root package's own version, so stamp both.
+      # awk + bash: macOS ships BSD sed (no -i/0,/re/) and Windows defaults
+      # to pwsh
       - name: Stamp version
+        shell: bash
         run: |
           set -euo pipefail
           ver="${{ needs.version.outputs.version }}"
-          sed -i "0,/^version = \".*\"$/s//version = \"$ver\"/" Cargo.toml
-          sed -i "/^name = \"rsusage\"$/,/^version = /s/^version = \".*\"$/version = \"$ver\"/" Cargo.lock
+          awk -v v="$ver" '!f && /^version = "/ {sub(/"[^"]*"/, "\"" v "\""); f=1} 1' \
+            Cargo.toml > Cargo.toml.stamped && mv Cargo.toml.stamped Cargo.toml
+          awk -v v="$ver" '/^name = "rsusage"$/ {f=1} f && /^version = "/ {sub(/"[^"]*"/, "\"" v "\""); f=0} 1' \
+            Cargo.lock > Cargo.lock.stamped && mv Cargo.lock.stamped Cargo.lock
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package binary
         shell: bash
