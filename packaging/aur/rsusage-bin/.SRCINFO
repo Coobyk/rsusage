@@ -8,6 +8,6 @@ pkgbase = rsusage-bin
 	depends = gcc-libs
 	provides = rsusage
 	conflicts = rsusage
-	source = https://github.com/Coobyk/rsusage/releases/download/v__VER__/rsusage-linux-x86_64.tar.gz
+	source = rsusage-bin-__VER__.tar.gz::https://github.com/Coobyk/rsusage/releases/download/v__VER__/rsusage-linux-x86_64.tar.gz
 	sha256sums = __SUM__
 pkgname = rsusage-bin
