@@ -78,11 +78,11 @@ jobs:
           if [ "${{ matrix.os }}" = "windows-latest" ]; then bin="rsusage.exe"; fi
           mkdir -p stage dist
           cp "target/${{ matrix.target }}/release/$bin" LICENSE stage/
-          tar -czf "dist/rsusage-${{ matrix.name }}.tar.gz" -C stage "$bin" LICENSE
+          tar -czf "dist/rsusage-${{ needs.version.outputs.version }}-${{ matrix.name }}.tar.gz" -C stage "$bin" LICENSE
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.name }}
-          path: dist/rsusage-${{ matrix.name }}.tar.gz
+          path: dist/rsusage-${{ needs.version.outputs.version }}-${{ matrix.name }}.tar.gz
           if-no-files-found: error
 
   release:
@@ -123,7 +123,7 @@ jobs:
           set -euo pipefail
           ver="${{ needs.version.outputs.version }}"
           curl -fsSL -o bin.tar.gz \
-            "https://github.com/Coobyk/rsusage/releases/download/v${ver}/rsusage-linux-x86_64.tar.gz"
+            "https://github.com/Coobyk/rsusage/releases/download/v${ver}/rsusage-${ver}-linux-x86_64.tar.gz"
           curl -fsSL -o src.tar.gz \
             "https://github.com/Coobyk/rsusage/archive/refs/tags/v${ver}.tar.gz"
           { echo "sum_bin=$(sha256sum bin.tar.gz | cut -d' ' -f1)"

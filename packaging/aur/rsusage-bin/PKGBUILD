@@ -11,9 +11,8 @@ license=('MIT')
 depends=('gcc-libs')
 provides=('rsusage')
 conflicts=('rsusage')
-# versioned local filename — a bare `rsusage-linux-x86_64.tar.gz` collides
-# with helpers' source caches across releases (stale file → sum mismatch)
-source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/rsusage-linux-x86_64.tar.gz")
+# versioned asset name keeps helpers' source caches distinct per release
+source=("$url/releases/download/v$pkgver/rsusage-$pkgver-linux-x86_64.tar.gz")
 sha256sums=('SKIP')
 
 package() {
