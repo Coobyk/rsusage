@@ -8,6 +8,19 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+/// File fan-out shared by the JSONL readers: rayon by default, sequential on
+/// the calling thread under `--single-thread`. Both paths preserve file order.
+fn map_files<F>(files: &[PathBuf], f: F) -> Vec<UsageEntry>
+where
+    F: Fn(&PathBuf) -> Vec<UsageEntry> + Sync + Send,
+{
+    if super::jsonl_serial() {
+        files.iter().flat_map(f).collect()
+    } else {
+        files.par_iter().flat_map(f).collect()
+    }
+}
+
 fn read_jsonl(path: &Path, mut f: impl FnMut(&serde_json::Value)) {
     let Ok(file) = std::fs::File::open(path) else {
         return;
@@ -123,9 +136,7 @@ impl AgentReader for Claude {
         let files = claude_files();
         let sig = file_sig(&files);
         sig_scan("claude", agent, sig, move || -> Vec<UsageEntry> {
-            files
-                .par_iter()
-                .flat_map(|path| {
+            map_files(&files, |path| {
                     let mut out = vec![];
                     // project = dir under projects/, session fallback = file stem
                     let project = path
@@ -143,8 +154,7 @@ impl AgentReader for Claude {
                         }
                     });
                     out
-                })
-                .collect()
+            })
         })
     }
 }
@@ -197,9 +207,7 @@ impl AgentReader for Codex {
         let sig = file_sig(&files);
         let sessions_dir = codex_dir();
         sig_scan("codex", agent, sig, move || -> Vec<UsageEntry> {
-            files
-                .par_iter()
-                .flat_map(|path| {
+            map_files(&files, |path| {
                     let session_id = codex_session_id(&sessions_dir, path);
                     let mut out: Vec<UsageEntry> = vec![];
                     // upstream: `current_model` tracks the last turn_context
@@ -385,8 +393,7 @@ impl AgentReader for Codex {
                         });
                     }
                     out
-                })
-                .collect()
+            })
         })
     }
 }
@@ -544,9 +551,7 @@ impl AgentReader for Grok {
         let files = grok_files();
         let sig = file_sig(&files);
         sig_scan("grok", agent, sig, move || -> Vec<UsageEntry> {
-            files
-                .par_iter()
-                .flat_map(|path| {
+            map_files(&files, |path| {
                     let meta = grok_session_meta(path);
                     let mut seen = std::collections::HashSet::new();
                     let mut out = vec![];
@@ -629,8 +634,7 @@ impl AgentReader for Grok {
                         }
                     });
                     out
-                })
-                .collect()
+            })
         })
     }
 }
@@ -843,9 +847,7 @@ impl AgentReader for GenericJsonl {
         files.sort();
         let sig = file_sig(&files);
         sig_scan(self.id, agent, sig, move || -> Vec<UsageEntry> {
-            files
-                .par_iter()
-                .flat_map(|path| {
+            map_files(&files, |path| {
                     let mut out = vec![];
                     let session = path
                         .file_stem()
@@ -921,8 +923,7 @@ impl AgentReader for GenericJsonl {
                         });
                     });
                     out
-                })
-                .collect()
+            })
         })
     }
 }

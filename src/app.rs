@@ -403,6 +403,7 @@ pub fn run_report(
     agent_id: Option<&'static str>,
 ) -> anyhow::Result<()> {
     let f = &args.filter;
+    agents::set_jsonl_serial(f.single_thread);
     // flag scoping and the --last/sections/date-window gates are enforced by
     // the cliparse pre-parser before dispatch
     if kind == Report::Session {
@@ -450,6 +451,7 @@ fn run_session_detail(
     agent_id: Option<&'static str>,
 ) -> anyhow::Result<()> {
     let f = &args.filter;
+    agents::set_jsonl_serial(f.single_thread);
     let agent = agent_id.unwrap_or("claude");
     let wants_json = f.json || f.jq.is_some();
     let readers = readers_for(Some(agent), false);
@@ -932,6 +934,7 @@ pub fn run_blocks(b: &BlocksArgs, _agent_id: Option<&'static str>) -> anyhow::Re
     // `--all` is an rsusage extension that widens it to every detected agent.
     let agent_id = if b.filter.all { None } else { Some("claude") };
     let f = &b.filter;
+    agents::set_jsonl_serial(f.single_thread);
     if b.session_length <= 0.0 {
         anyhow::bail!("Session length must be a positive number");
     }

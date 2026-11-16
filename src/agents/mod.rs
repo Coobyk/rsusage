@@ -24,6 +24,19 @@ pub trait AgentReader: Send + Sync {
     }
 }
 
+/// `--single-thread` — JSONL readers serialize their file fan-out when set.
+/// Written once at dispatch, before any reader runs.
+static JSONL_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_jsonl_serial(v: bool) {
+    JSONL_SERIAL.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn jsonl_serial() -> bool {
+    JSONL_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Recursively collect files matching a predicate.
 pub fn walk(dir: &Path, pred: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>, depth: u8) {
     if depth == 0 || !dir.is_dir() {
